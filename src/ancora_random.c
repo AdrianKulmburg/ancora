@@ -38,10 +38,34 @@ static flint_rand_t ancora_flint_rand_state;
 
 static uint64_t splitmix64Next(uint64_t *state);
 static uint64_t xorshiftNext(void);
-static double xorshiftUnit(void);
 /*******************************************************************************
  * Auxiliary functions - Definitions END
  ******************************************************************************/
+
+double xorshiftUnit(void)
+/* Draws a uniform double in [0, 1), from the top 53 bits of xorshiftNext's
+ * output (the highest-quality bits of a xorshift64* draw - see
+ * xorshiftNext's REFERENCES for why the top bits, not the bottom ones,
+ * are used here). 53 bits matches a double's mantissa width exactly, so
+ * this covers the full representable range of doubles in [0, 1) at full
+ * precision, rather than leaving some representable doubles unreachable.
+ * INPUT:
+ *      NONE (operates on the private ancora_xorshift_state via
+ *      xorshiftNext)
+ *
+ * OUTPUT:
+ *      double          : A uniform sample in [0, 1)
+ *
+ * RUNTIME:
+ *      O(1)
+ *
+ * Created:       2026-09-24
+ * Last modified: 2026-09-24
+ * Author(s):     Adrian Kulmburg
+ */
+{
+    return (double)(xorshiftNext() >> 11) * (1.0 / 9007199254740992.0); /* 2^53 */
+}
 
 void ancora_random_setSeed(unsigned int seed)
 /* Deterministically (re-)seeds ancora's random number generation from a
@@ -372,29 +396,4 @@ static uint64_t xorshiftNext(void)
     ancora_xorshift_state ^= ancora_xorshift_state << 25;
     ancora_xorshift_state ^= ancora_xorshift_state >> 27;
     return ancora_xorshift_state * 0x2545F4914F6CDD1DULL;
-}
-
-static double xorshiftUnit(void)
-/* Draws a uniform double in [0, 1), from the top 53 bits of xorshiftNext's
- * output (the highest-quality bits of a xorshift64* draw - see
- * xorshiftNext's REFERENCES for why the top bits, not the bottom ones,
- * are used here). 53 bits matches a double's mantissa width exactly, so
- * this covers the full representable range of doubles in [0, 1) at full
- * precision, rather than leaving some representable doubles unreachable.
- * INPUT:
- *      NONE (operates on the private ancora_xorshift_state via
- *      xorshiftNext)
- *
- * OUTPUT:
- *      double          : A uniform sample in [0, 1)
- *
- * RUNTIME:
- *      O(1)
- *
- * Created:       2026-09-24
- * Last modified: 2026-09-24
- * Author(s):     Adrian Kulmburg
- */
-{
-    return (double)(xorshiftNext() >> 11) * (1.0 / 9007199254740992.0); /* 2^53 */
 }

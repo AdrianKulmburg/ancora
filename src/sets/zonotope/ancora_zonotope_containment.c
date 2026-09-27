@@ -201,6 +201,9 @@ ancora_status ancora_zonotope_containsPoints(const ancora_zonotope *Z,
         goto cleanup;
     }
 
+    // Disable console logging
+    Highs_setBoolOptionValue(highs, "log_to_console", false);
+
     HighsInt pass_status = Highs_passLp(highs, numcol, numrow, numnz,
                                         kHighsMatrixFormatColwise,
                                         kHighsObjSenseMinimize, 0.0,
@@ -450,6 +453,9 @@ ancora_status ancora_zonotope_batched_containsPoints(
             status = ANCORA_ERROR_ALLOC;
             break;
         }
+
+        // Disable console logging
+        Highs_setBoolOptionValue(highs, "log_to_console", false);
 
         HighsInt pass_status = Highs_passLp(highs, numcol, numrow, numnz,
                                             kHighsMatrixFormatColwise,

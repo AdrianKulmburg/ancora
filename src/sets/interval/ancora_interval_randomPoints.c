@@ -99,27 +99,44 @@ ancora_status ancora_interval_randomPoints_uniform(ancora_mat *P,
      * SAFE mode, direct in FAST mode) and fed to ancora_random_uniform, which
      * is the mode-independent uniform sampler used by the existing set
      * templates (e.g. ancora_interval_initRandom_uniform). */
+#if ANCORA_MODE == ANCORA_MODE_SAFE
     double lo, hi, sample;
     for (slong j = 0; j < N; j++) {
         for (slong i = 0; i < n; i++) {
-#if ANCORA_MODE == ANCORA_MODE_SAFE
             // TODO: That's not quite ok, correct in the future
             lo = arb_get_d(arb_mat_entry(I->lowerBound.repr, i, 0));
             hi = arb_get_d(arb_mat_entry(I->upperBound.repr, i, 0));
-#elif ANCORA_MODE == ANCORA_MODE_FAST
-            lo = I->lowerBound.repr[i];
-            hi = I->upperBound.repr[i];
-#endif
+
             /* ancora_random_uniform handles lo == hi (returns lo) and rejects
              * lo > hi (an empty interval) with ANCORA_ERROR_INVALID_ARG. */
             ANCORA_TRY(ancora_random_uniform(lo, hi, &sample));
-#if ANCORA_MODE == ANCORA_MODE_SAFE
+
             arb_set_d(arb_mat_entry(P->repr, i, j), sample);
-#elif ANCORA_MODE == ANCORA_MODE_FAST
-            P->repr[i * N + j] = sample;
-#endif
         }
     }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+    ancora_random_ensureRandSeeded();
+    double lo, hi, range;
+    for (slong i = 0; i < n; i++) {
+        lo = I->lowerBound.repr[i];
+        hi = I->upperBound.repr[i];
+        if (lo > hi) {
+            ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG,
+                          "Invalid interval at component %ld: lower bound (%g) must be <= upper bound (%g).",
+                          (long)i, lo, hi);
+        }
+        range = hi - lo;
+        for (slong j = 0; j < N; j++) {
+            /* Direct xorshiftUnit draw, not a full ancora_random_uniform
+             * call: lo/hi/range are loop-invariant across j, and the
+             * validation ancora_random_uniform would repeat every call
+             * (NULL check, a>b check) has already been done once per row
+             * above - redoing it N times per row was pure waste. */
+            P->repr[i * N + j] = lo + xorshiftUnit_public() * range;
+        }
+    }
+#endif
+
 
     return ANCORA_OK;
 }
@@ -211,45 +228,32 @@ ancora_status ancora_interval_batched_randomPoints_uniform(
         }
     }
 
-    ancora_vec lbStack, ubStack, lbTmp, ubTmp;
+    ancora_vec lbStack, ubStack;
     ancora_mat Pbig;
     bool lbStackInit = false, ubStackInit = false, PbigInit = false;
     ancora_status status = ANCORA_OK;
 
-    /* Vertically stack every interval's lowerBound/upperBound into one
-     * (n*B x 1) vector each, one interval at a time. ancora_mat_vcat is
-     * used via the same ancora_vec/ancora_mat layout-compatibility
-     * convention already relied on elsewhere in this codebase (e.g.
-     * ancora_interval_affine, ancora_zonotope_contains). */
-    ANCORA_TRY(ancora_vec_init(&lbStack, n));
+    /* Allocate the full (n*B x 1) stacked bounds ONCE, then copy each
+     * interval's bounds directly into its own slice -- genuinely O(n*B),
+     * not the O(n*B^2) a repeated-vcat-growth loop would cost (see the
+     * NOTE above). */
+    status = ancora_vec_init(&lbStack, n * B);
+    if (status != ANCORA_OK) goto cleanup;
     lbStackInit = true;
-    ANCORA_TRY(ancora_vec_init(&ubStack, n));
+    status = ancora_vec_init(&ubStack, n * B);
+    if (status != ANCORA_OK) goto cleanup;
     ubStackInit = true;
 
+    for (slong b = 0; b < B; b++) {
 #if ANCORA_MODE == ANCORA_MODE_SAFE
-    for (slong i = 0; i < n; i++) {
-        arb_set(arb_mat_entry(lbStack.repr, i, 0), arb_mat_entry(I_batch[0]->lowerBound.repr, i, 0));
-        arb_set(arb_mat_entry(ubStack.repr, i, 0), arb_mat_entry(I_batch[0]->upperBound.repr, i, 0));
-    }
+        for (slong i = 0; i < n; i++) {
+            arb_set(arb_mat_entry(lbStack.repr, b * n + i, 0), arb_mat_entry(I_batch[b]->lowerBound.repr, i, 0));
+            arb_set(arb_mat_entry(ubStack.repr, b * n + i, 0), arb_mat_entry(I_batch[b]->upperBound.repr, i, 0));
+        }
 #elif ANCORA_MODE == ANCORA_MODE_FAST
-    memcpy(lbStack.repr, I_batch[0]->lowerBound.repr, (size_t)n * sizeof(double));
-    memcpy(ubStack.repr, I_batch[0]->upperBound.repr, (size_t)n * sizeof(double));
+        memcpy(&lbStack.repr[b * n], I_batch[b]->lowerBound.repr, (size_t)n * sizeof(double));
+        memcpy(&ubStack.repr[b * n], I_batch[b]->upperBound.repr, (size_t)n * sizeof(double));
 #endif
-
-    for (slong b = 1; b < B; b++) {
-        status = ancora_vec_init(&lbTmp, n * (b + 1));
-        if (status != ANCORA_OK) goto cleanup;
-        status = ancora_mat_vcat((ancora_mat *)&lbTmp, (ancora_mat *)&lbStack, (ancora_mat *)&I_batch[b]->lowerBound);
-        if (status != ANCORA_OK) { ancora_vec_free(&lbTmp); goto cleanup; }
-        ancora_vec_free(&lbStack);
-        lbStack = lbTmp;
-
-        status = ancora_vec_init(&ubTmp, n * (b + 1));
-        if (status != ANCORA_OK) goto cleanup;
-        status = ancora_mat_vcat((ancora_mat *)&ubTmp, (ancora_mat *)&ubStack, (ancora_mat *)&I_batch[b]->upperBound);
-        if (status != ANCORA_OK) { ancora_vec_free(&ubTmp); goto cleanup; }
-        ancora_vec_free(&ubStack);
-        ubStack = ubTmp;
     }
 
     /* Assemble the stacked interval directly, taking ownership of

@@ -120,7 +120,6 @@ if(ANCORA_USE_GPU)
 
     if(ANCORA_GPU_PLATFORM STREQUAL "nvidia")
         set(ENV{HIP_PLATFORM} "nvidia")
-        set(ENV{HIP_CXX_COMPILER} "clang++")
     else()
         set(ENV{HIP_PLATFORM} "amd")
     endif()
