@@ -35,7 +35,8 @@
 #
 # ============================================================================
 
-cmake_minimum_required(VERSION 3.21)
+# NVIDIA HIP language support (HIP-over-CUDA via NVCC) requires CMake 3.28+.
+cmake_minimum_required(VERSION 3.28)
 
 
 # ============================================================================
@@ -310,24 +311,25 @@ if(ANCORA_USE_GPU)
 
 
     # ------------------------------------------------------------------------
-    # CMake 3.28+ has CMAKE_HIP_PLATFORM.
+    # CMake 3.28+ is required for NVIDIA HIP language support.
     #
-    # Older versions, including CMake 3.22, don't have it; HIP_PLATFORM above
-    # is sufficient for the ROCm HIP package/compiler selection.
+    # On NVIDIA, CMake's native HIP language support uses NVCC as the HIP
+    # compiler. HIP_PLATFORM is still set above so ROCm's HIP package and
+    # hipBLAS configuration select the NVIDIA backend.
     # ------------------------------------------------------------------------
 
-    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.28")
-
-        set(
-            CMAKE_HIP_PLATFORM
-            "${ANCORA_GPU_PLATFORM}"
-        )
-
-    endif()
+    set(
+        CMAKE_HIP_PLATFORM
+        "${ANCORA_GPU_PLATFORM}"
+    )
 
 
     # ------------------------------------------------------------------------
     # Enable HIP
+    #
+    # For NVIDIA, CMake 3.28+ selects NVCC for the HIP language when
+    # CMAKE_HIP_PLATFORM is "nvidia". The install script also passes
+    # CMAKE_HIP_COMPILER explicitly to avoid compiler autodetection ambiguity.
     # ------------------------------------------------------------------------
 
     enable_language(HIP)
