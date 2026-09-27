@@ -550,16 +550,18 @@ else()
 
         include(CheckSymbolExists)
 
-        set(
-            CMAKE_REQUIRED_LIBRARIES
-            ${BLAS_LIBRARIES}
-        )
+        set(CMAKE_REQUIRED_LIBRARIES ${BLAS_LIBRARIES})
+
+        if(BLAS_INCLUDE_DIRS)
+            set(CMAKE_REQUIRED_INCLUDES ${BLAS_INCLUDE_DIRS})
+        endif()
 
         check_symbol_exists(
             cblas_domatcopy
             "cblas.h"
             ANCORA_HAVE_CBLAS_DOMATCOPY
         )
+
 
         if(ANCORA_HAVE_CBLAS_DOMATCOPY)
 
