@@ -24,6 +24,19 @@ ancora_status ancora_interval_minkowskiSum(ancora_interval *res,
                                            const ancora_interval *J)
 /* Minkowski sum of two intervals: res = I + J = { x + y | x in I, y in J }.
  *
+ * This computes the entrywise addition directly against
+ * lowerBound/upperBound.repr rather than delegating to ancora_vec_add:
+ * that generic path re-validates NULL/dimensions this function has
+ * already checked, and -- critically -- if ANCORA_USE_GPU is defined,
+ * ancora_vec_add's underlying ancora_mat_add unconditionally dispatches
+ * to the GPU, meaning every call here would pay TWO full GPU round trips
+ * (hipMalloc/hipMemcpy/kernel launch/hipMemcpy back/hipFree, once each
+ * for lowerBound and upperBound) for what is typically a tiny O(n)
+ * addition -- GPU dispatch overhead dominating a cheap elementwise op is
+ * exactly the caveat flagged for ancora_interval_batched_minkowskiSum;
+ * unlike that function, this single-instance one has no size threshold
+ * to justify paying it at all, so it never should.
+ *
  * INPUT:
  *      res             : Result interval, already initialized with the same
  *                        dimension as I and J
@@ -37,11 +50,10 @@ ancora_status ancora_interval_minkowskiSum(ancora_interval *res,
  *      O(n*ANCORA_DEFAULT_PREC)
  *
  * Created:       2026-09-25
- * Last modified: 2026-09-25
+ * Last modified: 2026-09-27
  * Author(s):     Adrian Kulmburg
  */
 {
-    // Check that all intervals are valid
     if (res == NULL) {
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer res is NULL; it should point to a valid ancora_interval instance.");
     }
@@ -57,7 +69,6 @@ ancora_status ancora_interval_minkowskiSum(ancora_interval *res,
     ANCORA_TRY(ancora_interval_dimension(J, &Jdim));
     ANCORA_TRY(ancora_interval_dimension(res, &resDim));
 
-    // Check dimensions
     if (Idim != Jdim) {
         ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
                       "Interval I has dimension %ld, interval J has dimension %ld; they need to be the same.",
@@ -69,12 +80,25 @@ ancora_status ancora_interval_minkowskiSum(ancora_interval *res,
                       (long)Idim, (long)Jdim);
     }
 
-    // Just add the lower and upper bounds
-    ANCORA_TRY(ancora_vec_add(&res->lowerBound, &I->lowerBound, &J->lowerBound));
-    ANCORA_TRY(ancora_vec_add(&res->upperBound, &I->upperBound, &J->upperBound));
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+    for (slong i = 0; i < Idim; i++) {
+        arb_add(arb_mat_entry(res->lowerBound.repr, i, 0),
+                arb_mat_entry(I->lowerBound.repr, i, 0),
+                arb_mat_entry(J->lowerBound.repr, i, 0), ANCORA_DEFAULT_PREC);
+        arb_add(arb_mat_entry(res->upperBound.repr, i, 0),
+                arb_mat_entry(I->upperBound.repr, i, 0),
+                arb_mat_entry(J->upperBound.repr, i, 0), ANCORA_DEFAULT_PREC);
+    }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+    for (slong i = 0; i < Idim; i++) {
+        res->lowerBound.repr[i] = I->lowerBound.repr[i] + J->lowerBound.repr[i];
+        res->upperBound.repr[i] = I->upperBound.repr[i] + J->upperBound.repr[i];
+    }
+#endif
 
     return ANCORA_OK;
 }
+
 
 ancora_status ancora_interval_batched_minkowskiSum(
     ancora_interval **res_batch,
@@ -188,41 +212,44 @@ ancora_status ancora_interval_batched_minkowskiSum(
         }
     }
 #elif ANCORA_MODE == ANCORA_MODE_FAST
-    #ifdef ANCORA_USE_GPU
-        // Pack every interval's bounds into flat (B*n)-length buffers, then
-        // reuse the existing ancora_mat_add_gpu kernel directly - Minkowski
-        // sum on intervals IS elementwise addition, so no new kernel needed.
-        double *I_lo = (double *)malloc((size_t)(B * n) * sizeof(double));
-        double *I_hi = (double *)malloc((size_t)(B * n) * sizeof(double));
-        double *J_lo = (double *)malloc((size_t)(B * n) * sizeof(double));
-        double *J_hi = (double *)malloc((size_t)(B * n) * sizeof(double));
-        double *res_lo = (double *)malloc((size_t)(B * n) * sizeof(double));
-        double *res_hi = (double *)malloc((size_t)(B * n) * sizeof(double));
-        if (I_lo == NULL || I_hi == NULL || J_lo == NULL || J_hi == NULL ||
-            res_lo == NULL || res_hi == NULL) {
-            free(I_lo); free(I_hi); free(J_lo); free(J_hi); free(res_lo); free(res_hi);
+        #ifdef ANCORA_USE_GPU
+        // Pack BOTH lowerBound and upperBound into ONE combined buffer per
+        // operand (length 2*n*B: first n*B entries are every lowerBound,
+        // next n*B are every upperBound), rather than two separate buffers
+        // dispatched as two separate ancora_mat_add_gpu calls. Since both
+        // halves go through the identical elementwise-add kernel, this
+        // halves the GPU round-trip overhead (one hipMalloc/hipMemcpy/
+        // kernel-launch/hipMemcpy/hipFree cycle instead of two) for
+        // identical total arithmetic -- meaningful here specifically
+        // because Minkowski sum's actual compute is so cheap that dispatch
+        // overhead, not arithmetic, is the dominant cost.
+        slong half = n * B;
+        double *I_combined = (double *)malloc((size_t)(2 * half) * sizeof(double));
+        double *J_combined = (double *)malloc((size_t)(2 * half) * sizeof(double));
+        double *res_combined = (double *)malloc((size_t)(2 * half) * sizeof(double));
+        if (I_combined == NULL || J_combined == NULL || res_combined == NULL) {
+            free(I_combined); free(J_combined); free(res_combined);
             ANCORA_ERROR(ANCORA_ERROR_ALLOC, "ancora_interval_batched_minkowskiSum: failed to allocate GPU packing buffers.");
         }
         for (slong b = 0; b < B; b++) {
-            memcpy(&I_lo[b * n], I_batch[b]->lowerBound.repr, (size_t)n * sizeof(double));
-            memcpy(&I_hi[b * n], I_batch[b]->upperBound.repr, (size_t)n * sizeof(double));
-            memcpy(&J_lo[b * n], J_batch[b]->lowerBound.repr, (size_t)n * sizeof(double));
-            memcpy(&J_hi[b * n], J_batch[b]->upperBound.repr, (size_t)n * sizeof(double));
+            memcpy(&I_combined[b * n], I_batch[b]->lowerBound.repr, (size_t)n * sizeof(double));
+            memcpy(&I_combined[half + b * n], I_batch[b]->upperBound.repr, (size_t)n * sizeof(double));
+            memcpy(&J_combined[b * n], J_batch[b]->lowerBound.repr, (size_t)n * sizeof(double));
+            memcpy(&J_combined[half + b * n], J_batch[b]->upperBound.repr, (size_t)n * sizeof(double));
         }
 
-        int status_lo = ancora_mat_add_gpu(I_lo, J_lo, res_lo, (size_t)(B * n));
-        int status_hi = ancora_mat_add_gpu(I_hi, J_hi, res_hi, (size_t)(B * n));
+        int gpu_status = ancora_mat_add_gpu(I_combined, J_combined, res_combined, (size_t)(2 * half));
 
-        if (status_lo == 0 && status_hi == 0) {
+        if (gpu_status == 0) {
             for (slong b = 0; b < B; b++) {
-                memcpy(res_batch[b]->lowerBound.repr, &res_lo[b * n], (size_t)n * sizeof(double));
-                memcpy(res_batch[b]->upperBound.repr, &res_hi[b * n], (size_t)n * sizeof(double));
+                memcpy(res_batch[b]->lowerBound.repr, &res_combined[b * n], (size_t)n * sizeof(double));
+                memcpy(res_batch[b]->upperBound.repr, &res_combined[half + b * n], (size_t)n * sizeof(double));
             }
         }
 
-        free(I_lo); free(I_hi); free(J_lo); free(J_hi); free(res_lo); free(res_hi);
+        free(I_combined); free(J_combined); free(res_combined);
 
-        if (status_lo != 0 || status_hi != 0) {
+        if (gpu_status != 0) {
             ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "ancora_interval_batched_minkowskiSum: GPU kernel launch failed.");
         }
     #else

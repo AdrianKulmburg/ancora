@@ -68,9 +68,6 @@ double xorshiftUnit(void);
  * Last modified: 2026-09-24
  * Author(s):     Adrian Kulmburg
  */
-{
-    return (double)(xorshiftNext() >> 11) * (1.0 / 9007199254740992.0); /* 2^53 */
-}
 
 void ancora_random_setSeed(unsigned int seed);
 /* Deterministically (re-)seeds ancora's random number generation from a
