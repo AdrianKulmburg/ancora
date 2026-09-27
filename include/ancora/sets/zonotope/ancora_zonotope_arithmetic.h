@@ -154,6 +154,70 @@ ancora_status ancora_zonotope_batched_affine(
  * Author(s):     Adrian Kulmburg
  */
 
+ancora_status ancora_zonotope_matMul(ancora_zonotope *res,
+                                     const ancora_mat *A,
+                                     const ancora_zonotope *Z);
+/* Matrix map of a zonotope, without translation: res = A*Z = { A*x | x in Z }.
+ *
+ * Same computation as ancora_zonotope_affine with c omitted entirely (not
+ * even a zero vector is allocated). Like that function, this concatenates
+ * Z.c and Z.G into one (m x (p+1)) matrix and performs A*[Z.c | Z.G] as a
+ * SINGLE matmul rather than two separate ones.
+ *
+ * INPUT:
+ *      res             : Result zonotope, already initialized as dimension n
+ *                        with p generators
+ *      A               : Matrix (n x m)
+ *      Z               : Zonotope to map (dimension m, p generators)
+ *
+ * OUTPUT:
+ *      ancora_status   : Status (i.e., whether errors arose)
+ *
+ * RUNTIME:
+ *      O(n*m*p*ANCORA_DEFAULT_PREC) (one (n x m)*(m x (p+1)) matmul; see
+ *      ancora_zonotope_affine).
+ *
+ * Created:       2026-09-27
+ * Last modified: 2026-09-27
+ * Author(s):     Adrian Kulmburg
+ */
+
+ancora_status ancora_zonotope_batched_matMul(
+    ancora_zonotope **res_batch,
+    const ancora_mat *A,
+    const ancora_zonotope **Z_batch,
+    slong B);
+/* Computes res_batch[b] = A*Z_batch[b] for every b in [0, B) (no
+ * translation). A (n x m) is SHARED across the batch; only the zonotopes
+ * differ (generator counts p_b may differ). Same as
+ * ancora_zonotope_batched_affine with c omitted: packs every pair's
+ * generators AND center into one combined (m x (P+B)) matrix and performs
+ * A*Combined as a SINGLE matmul for the whole batch.
+ *
+ * INPUT:
+ *      res_batch       : Array of B pointers, each already initialized
+ *                        with dimension n and p_b generators (p_b =
+ *                        Z_batch[b]->G.ncols); res_batch[b] receives
+ *                        A*Z_batch[b]
+ *      A               : Linear map (n x m), shared across the batch
+ *      Z_batch         : Array of B pointers to initialized
+ *                        ancora_zonotope instances, all of dimension m
+ *                        (generator counts may differ)
+ *      B               : Number of zonotopes in the batch (>= 0)
+ *
+ * OUTPUT:
+ *      ancora_status   : Status (i.e., whether errors arose)
+ *
+ * RUNTIME:
+ *      O(n*m*P*ANCORA_DEFAULT_PREC) where P = sum_b p_b (see
+ *      ancora_zonotope_batched_affine); one matmul dispatch for the
+ *      entire batch.
+ *
+ * Created:       2026-09-27
+ * Last modified: 2026-09-27
+ * Author(s):     Adrian Kulmburg
+ */
+
 #ifdef __cplusplus
 }
 #endif

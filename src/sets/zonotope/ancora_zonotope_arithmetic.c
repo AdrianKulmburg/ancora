@@ -269,6 +269,15 @@ ancora_status ancora_zonotope_affine(ancora_zonotope *res,
                                      const ancora_zonotope *Z)
 /* Affine map of a zonotope: res = A*Z + c = { A*x + c | x in Z }.
  *
+ * This concatenates Z.c and Z.G into one (m x (p+1)) matrix and performs
+ * A*[Z.c | Z.G] as a SINGLE matmul, rather than two separate matmuls
+ * (res.c = A*Z.c, res.G = A*Z.G) as an earlier version of this function
+ * did. Since both products share the same left operand A, this halves
+ * the matmul dispatch count (and, with ANCORA_USE_GPU, the GPU kernel
+ * launch count) for identical total arithmetic -- the concatenation/
+ * splitting overhead is O(n*m + n*(p+1)), negligible next to the
+ * O(n*m*p) matmul itself.
+ *
  * INPUT:
  *      res             : Result zonotope, already initialized as dimension n
  *                        with p generators
@@ -280,14 +289,15 @@ ancora_status ancora_zonotope_affine(ancora_zonotope *res,
  *      ancora_status   : Status (i.e., whether errors arose)
  *
  * RUNTIME:
- *      O(n*m*p*ANCORA_DEFAULT_PREC)
+ *      O(n*m*p*ANCORA_DEFAULT_PREC) (one (n x m)*(m x (p+1)) matmul,
+ *      instead of two separate (n x m)*(m x 1) and (n x m)*(m x p)
+ *      matmuls of the same combined cost, but issued as one dispatch).
  *
  * Created:       2026-09-25
- * Last modified: 2026-09-25
+ * Last modified: 2026-09-27
  * Author(s):     Adrian Kulmburg
  */
 {
-    // Check that res, A, c, and Z are well-defined
     if (res == NULL) {
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer res is NULL; it should point to a valid ancora_zonotope instance.");
     }
@@ -300,25 +310,19 @@ ancora_status ancora_zonotope_affine(ancora_zonotope *res,
     if (Z == NULL) {
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer Z is NULL; it should point to a valid ancora_zonotope instance.");
     }
-    // Verify that c is a vector
     bool isVector;
     ANCORA_TRY(ancora_mat_isVector(c, &isVector));
-    if (!isVector)
-    {
+    if (!isVector) {
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer c is not a vector; it should point to a valid ancora_vec instance.");
     }
 
-    // Check dimensions
     slong mZ;
     ANCORA_TRY(ancora_zonotope_dimension(Z, &mZ));
-
     slong n;
     ANCORA_TRY(ancora_zonotope_dimension(res, &n));
 
-    // TODO: Perhaps there should be a dedicated function for this?
-    slong p, pZ;
-    p = res->G.ncols;
-    pZ = Z->G.ncols;
+    slong p = res->G.ncols;
+    slong pZ = Z->G.ncols;
 
     if (mZ != A->ncols) {
         ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
@@ -340,17 +344,45 @@ ancora_status ancora_zonotope_affine(ancora_zonotope *res,
                       "Result should have %ld generators, but res has %ld.",
                       (long)pZ, (long)p);
     }
-    /* res must be a distinct zonotope from Z: the affine map is not an
-     * elementwise operation, so aliasing would corrupt the result. */
     if (res == Z) {
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "res must not alias Z for ancora_zonotope_affine.");
     }
 
-    /* res.center = A*Z.c + c */
-    ANCORA_TRY(ancora_mat_mul(&res->c, A, &Z->c));
-    ANCORA_TRY(ancora_vec_add(&res->c, &res->c, c));
-    /* res.generators = A*Z.G */
-    ANCORA_TRY(ancora_mat_mul(&res->G, A, &Z->G));
+    ancora_mat CG, RCG;
+    ANCORA_TRY(ancora_mat_init(&CG, mZ, p + 1));
+    ANCORA_TRY(ancora_mat_init(&RCG, n, p + 1));
+
+    // CG = [Z.c | Z.G]
+    for (slong i = 0; i < mZ; i++) {
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+        arb_set(arb_mat_entry(CG.repr, i, 0), arb_mat_entry(Z->c.repr, i, 0));
+        for (slong j = 0; j < p; j++) {
+            arb_set(arb_mat_entry(CG.repr, i, 1 + j), arb_mat_entry(Z->G.repr, i, j));
+        }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+        CG.repr[i * (p + 1)] = Z->c.repr[i];
+        memcpy(&CG.repr[i * (p + 1) + 1], &Z->G.repr[i * p], (size_t)p * sizeof(double));
+#endif
+    }
+
+    // ONE matmul: RCG = A * [Z.c | Z.G]
+    ANCORA_TRY(ancora_mat_mul(&RCG, A, &CG));
+
+    // Split back apart: column 0 (+c) is res.c, columns [1, p+1) are res.G.
+    for (slong i = 0; i < n; i++) {
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+        arb_add(arb_mat_entry(res->c.repr, i, 0), arb_mat_entry(RCG.repr, i, 0), arb_mat_entry(c->repr, i, 0), ANCORA_DEFAULT_PREC);
+        for (slong j = 0; j < p; j++) {
+            arb_set(arb_mat_entry(res->G.repr, i, j), arb_mat_entry(RCG.repr, i, 1 + j));
+        }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+        res->c.repr[i] = RCG.repr[i * (p + 1)] + c->repr[i];
+        memcpy(&res->G.repr[i * p], &RCG.repr[i * (p + 1) + 1], (size_t)p * sizeof(double));
+#endif
+    }
+
+    ANCORA_TRY(ancora_mat_free(&CG));
+    ANCORA_TRY(ancora_mat_free(&RCG));
 
     return ANCORA_OK;
 }
@@ -368,6 +400,15 @@ ancora_status ancora_zonotope_batched_affine(
  * and p_b generators (matching Z_batch[b]'s own generator count, same
  * requirement as the single-instance ancora_zonotope_affine).
  *
+ * This packs every pair's generators AND center into ONE combined
+ * (m x (P+B)) matrix (P = sum_b p_b) -- columns [0, P) hold every pair's
+ * generators (as before), columns [P, P+B) hold every pair's center, one
+ * per column -- and performs A*Combined as a SINGLE matmul, rather than
+ * two separate matmuls (Gres = A*Gstack, Cres = A*Cstack) as an earlier
+ * version of this function did. Since both share the same left operand
+ * A, this consolidates the batch's entire linear-algebra cost into
+ * exactly ONE matmul dispatch (and, with ANCORA_USE_GPU, one GPU kernel
+ * launch) instead of two.
  *
  * INPUT:
  *      res_batch       : Array of B pointers, each already initialized
@@ -386,13 +427,12 @@ ancora_status ancora_zonotope_batched_affine(
  *      ancora_status   : Status (i.e., whether errors arose)
  *
  * RUNTIME:
- *      O(n*m*P*ANCORA_DEFAULT_PREC) where P = sum_b p_b - identical total
- *      arithmetic to B separate ancora_zonotope_affine calls (this is a
- *      genuine matmul, so there is no less total work possible); the
- *      packing/slicing passes add O(m*P + m*B + n*P + n*B), the same
- *      order as the work itself. The improvement is consolidating 2*B
- *      matmuls (and, with ANCORA_USE_GPU, 2*B GPU kernel launches) into
- *      exactly 2.
+ *      O(n*m*P*ANCORA_DEFAULT_PREC) where P = sum_b p_b -- identical total
+ *      arithmetic to B separate ancora_zonotope_affine calls; the
+ *      packing/slicing passes add O(m*(P+B) + n*(P+B)), the same order as
+ *      the work itself. The improvement is consolidating the batch's
+ *      matmul work into exactly ONE dispatch (and one GPU kernel launch,
+ *      if ANCORA_USE_GPU) instead of two.
  *
  * Created:       2026-09-27
  * Last modified: 2026-09-27
@@ -434,8 +474,6 @@ ancora_status ancora_zonotope_batched_affine(
         return ANCORA_OK; /* vacuously nothing to do */
     }
 
-    // Validate every entry up front, and compute per-pair generator counts
-    // and their cumulative offsets into the concatenated (m x P) matrix.
     slong *p = (slong *)malloc((size_t)B * sizeof(slong));
     slong *offset = (slong *)malloc((size_t)B * sizeof(slong));
     if (p == NULL || offset == NULL) {
@@ -486,76 +524,324 @@ ancora_status ancora_zonotope_batched_affine(
         P += p[b];
     }
 
-    ancora_mat Gstack, Cstack, Gres, Cres;
-    bool GstackInit = false, CstackInit = false, GresInit = false, CresInit = false;
+    ancora_mat Combined, ResCombined;
+    bool CombinedInit = false, ResCombinedInit = false;
 
-    status = ancora_mat_init(&Gstack, m, P);
+    // Combined has P+B columns: [0, P) generators, [P, P+B) centers.
+    status = ancora_mat_init(&Combined, m, P + B);
     if (status != ANCORA_OK) goto cleanup;
-    GstackInit = true;
-    status = ancora_mat_init(&Cstack, m, B);
+    CombinedInit = true;
+    status = ancora_mat_init(&ResCombined, n, P + B);
     if (status != ANCORA_OK) goto cleanup;
-    CstackInit = true;
-    status = ancora_mat_init(&Gres, n, P);
-    if (status != ANCORA_OK) goto cleanup;
-    GresInit = true;
-    status = ancora_mat_init(&Cres, n, B);
-    if (status != ANCORA_OK) goto cleanup;
-    CresInit = true;
+    ResCombinedInit = true;
 
-    // Fill Gstack's column range [offset[b], offset[b]+p[b]) with
-    // Z_batch[b]->G, and column b of Cstack with Z_batch[b]->c.
     for (slong b = 0; b < B; b++) {
         for (slong i = 0; i < m; i++) {
 #if ANCORA_MODE == ANCORA_MODE_SAFE
-            arb_set(arb_mat_entry(Cstack.repr, i, b), arb_mat_entry(Z_batch[b]->c.repr, i, 0));
+            arb_set(arb_mat_entry(Combined.repr, i, P + b), arb_mat_entry(Z_batch[b]->c.repr, i, 0));
             for (slong j = 0; j < p[b]; j++) {
-                arb_set(arb_mat_entry(Gstack.repr, i, offset[b] + j), arb_mat_entry(Z_batch[b]->G.repr, i, j));
+                arb_set(arb_mat_entry(Combined.repr, i, offset[b] + j), arb_mat_entry(Z_batch[b]->G.repr, i, j));
             }
 #elif ANCORA_MODE == ANCORA_MODE_FAST
-            Cstack.repr[i * B + b] = Z_batch[b]->c.repr[i];
-            for (slong j = 0; j < p[b]; j++) {
-                Gstack.repr[i * P + offset[b] + j] = Z_batch[b]->G.repr[i * p[b] + j];
-            }
+            Combined.repr[i * (P + B) + P + b] = Z_batch[b]->c.repr[i];
+            memcpy(&Combined.repr[i * (P + B) + offset[b]], &Z_batch[b]->G.repr[i * p[b]], (size_t)p[b] * sizeof(double));
 #endif
         }
     }
 
-    // Exactly TWO matmuls for the entire batch. If ANCORA_USE_GPU is
-    // defined, ancora_mat_mul dispatches these to the GPU itself.
-    status = ancora_mat_mul(&Gres, A, &Gstack);
-    if (status != ANCORA_OK) goto cleanup;
-    status = ancora_mat_mul(&Cres, A, &Cstack);
+    // Exactly ONE matmul for the entire batch (generators AND centers).
+    status = ancora_mat_mul(&ResCombined, A, &Combined);
     if (status != ANCORA_OK) goto cleanup;
 
-    // Slice the results back apart: column range [offset[b], offset[b]+p[b])
-    // of Gres is res_batch[b]->G; column b of Cres, plus c, is res_batch[b]->c.
     for (slong b = 0; b < B; b++) {
         for (slong i = 0; i < n; i++) {
 #if ANCORA_MODE == ANCORA_MODE_SAFE
             arb_add(arb_mat_entry(res_batch[b]->c.repr, i, 0),
-                    arb_mat_entry(Cres.repr, i, b),
+                    arb_mat_entry(ResCombined.repr, i, P + b),
                     arb_mat_entry(c->repr, i, 0),
                     ANCORA_DEFAULT_PREC);
             for (slong j = 0; j < p[b]; j++) {
-                arb_set(arb_mat_entry(res_batch[b]->G.repr, i, j), arb_mat_entry(Gres.repr, i, offset[b] + j));
+                arb_set(arb_mat_entry(res_batch[b]->G.repr, i, j), arb_mat_entry(ResCombined.repr, i, offset[b] + j));
             }
 #elif ANCORA_MODE == ANCORA_MODE_FAST
-            res_batch[b]->c.repr[i] = Cres.repr[i * B + b] + c->repr[i];
-            memcpy(&res_batch[b]->G.repr[i * p[b]], &Gres.repr[i * P + offset[b]], (size_t)p[b] * sizeof(double));
+            res_batch[b]->c.repr[i] = ResCombined.repr[i * (P + B) + P + b] + c->repr[i];
+            memcpy(&res_batch[b]->G.repr[i * p[b]], &ResCombined.repr[i * (P + B) + offset[b]], (size_t)p[b] * sizeof(double));
 #endif
         }
     }
 
 cleanup:
-    if (GstackInit) ancora_mat_free(&Gstack);
-    if (CstackInit) ancora_mat_free(&Cstack);
-    if (GresInit) ancora_mat_free(&Gres);
-    if (CresInit) ancora_mat_free(&Cres);
+    if (CombinedInit) ancora_mat_free(&Combined);
+    if (ResCombinedInit) ancora_mat_free(&ResCombined);
     free(p);
     free(offset);
 
     if (status != ANCORA_OK) {
         ANCORA_ERROR(status, "ancora_zonotope_batched_affine: concatenation/matmul/slicing failed (see above).");
+    }
+    return ANCORA_OK;
+}
+
+ancora_status ancora_zonotope_matMul(ancora_zonotope *res,
+                                     const ancora_mat *A,
+                                     const ancora_zonotope *Z)
+/* Matrix map of a zonotope, without translation: res = A*Z = { A*x | x in Z }.
+ *
+ * Same computation as ancora_zonotope_affine with c omitted entirely (not
+ * even a zero vector is allocated). Like that function, this concatenates
+ * Z.c and Z.G into one (m x (p+1)) matrix and performs A*[Z.c | Z.G] as a
+ * SINGLE matmul rather than two separate ones.
+ *
+ * INPUT:
+ *      res             : Result zonotope, already initialized as dimension n
+ *                        with p generators
+ *      A               : Matrix (n x m)
+ *      Z               : Zonotope to map (dimension m, p generators)
+ *
+ * OUTPUT:
+ *      ancora_status   : Status (i.e., whether errors arose)
+ *
+ * RUNTIME:
+ *      O(n*m*p*ANCORA_DEFAULT_PREC) (one (n x m)*(m x (p+1)) matmul; see
+ *      ancora_zonotope_affine).
+ *
+ * Created:       2026-09-27
+ * Last modified: 2026-09-27
+ * Author(s):     Adrian Kulmburg
+ */
+{
+    if (res == NULL) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer res is NULL; it should point to a valid ancora_zonotope instance.");
+    }
+    if (A == NULL) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer A is NULL; it should point to a valid ancora_mat instance.");
+    }
+    if (Z == NULL) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer Z is NULL; it should point to a valid ancora_zonotope instance.");
+    }
+
+    slong mZ;
+    ANCORA_TRY(ancora_zonotope_dimension(Z, &mZ));
+    slong n;
+    ANCORA_TRY(ancora_zonotope_dimension(res, &n));
+
+    slong p = res->G.ncols;
+    slong pZ = Z->G.ncols;
+
+    if (mZ != A->ncols) {
+        ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
+                      "Matrix A has %ld columns, zonotope Z has dimension %ld; they need to be the same.",
+                      (long)A->ncols, (long)mZ);
+    }
+    if (n != A->nrows) {
+        ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
+                      "Result should have dimension %ld, but res has dimension %ld.",
+                      (long)A->nrows, (long)n);
+    }
+    if (p != pZ) {
+        ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
+                      "Result should have %ld generators, but res has %ld.",
+                      (long)pZ, (long)p);
+    }
+    if (res == Z) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "res must not alias Z for ancora_zonotope_matMul.");
+    }
+
+    ancora_mat CG, RCG;
+    ANCORA_TRY(ancora_mat_init(&CG, mZ, p + 1));
+    ANCORA_TRY(ancora_mat_init(&RCG, n, p + 1));
+
+    // CG = [Z.c | Z.G]
+    for (slong i = 0; i < mZ; i++) {
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+        arb_set(arb_mat_entry(CG.repr, i, 0), arb_mat_entry(Z->c.repr, i, 0));
+        for (slong j = 0; j < p; j++) {
+            arb_set(arb_mat_entry(CG.repr, i, 1 + j), arb_mat_entry(Z->G.repr, i, j));
+        }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+        CG.repr[i * (p + 1)] = Z->c.repr[i];
+        memcpy(&CG.repr[i * (p + 1) + 1], &Z->G.repr[i * p], (size_t)p * sizeof(double));
+#endif
+    }
+
+    // ONE matmul: RCG = A * [Z.c | Z.G]
+    ANCORA_TRY(ancora_mat_mul(&RCG, A, &CG));
+
+    // Split back apart: no c to add here, column 0 is res.c directly.
+    for (slong i = 0; i < n; i++) {
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+        arb_set(arb_mat_entry(res->c.repr, i, 0), arb_mat_entry(RCG.repr, i, 0));
+        for (slong j = 0; j < p; j++) {
+            arb_set(arb_mat_entry(res->G.repr, i, j), arb_mat_entry(RCG.repr, i, 1 + j));
+        }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+        res->c.repr[i] = RCG.repr[i * (p + 1)];
+        memcpy(&res->G.repr[i * p], &RCG.repr[i * (p + 1) + 1], (size_t)p * sizeof(double));
+#endif
+    }
+
+    ANCORA_TRY(ancora_mat_free(&CG));
+    ANCORA_TRY(ancora_mat_free(&RCG));
+
+    return ANCORA_OK;
+}
+
+ancora_status ancora_zonotope_batched_matMul(
+    ancora_zonotope **res_batch,
+    const ancora_mat *A,
+    const ancora_zonotope **Z_batch,
+    slong B)
+/* Computes res_batch[b] = A*Z_batch[b] for every b in [0, B) (no
+ * translation). A (n x m) is SHARED across the batch; only the zonotopes
+ * differ (generator counts p_b may differ). Same as
+ * ancora_zonotope_batched_affine with c omitted: packs every pair's
+ * generators AND center into one combined (m x (P+B)) matrix and performs
+ * A*Combined as a SINGLE matmul for the whole batch.
+ *
+ * INPUT:
+ *      res_batch       : Array of B pointers, each already initialized
+ *                        with dimension n and p_b generators (p_b =
+ *                        Z_batch[b]->G.ncols); res_batch[b] receives
+ *                        A*Z_batch[b]
+ *      A               : Linear map (n x m), shared across the batch
+ *      Z_batch         : Array of B pointers to initialized
+ *                        ancora_zonotope instances, all of dimension m
+ *                        (generator counts may differ)
+ *      B               : Number of zonotopes in the batch (>= 0)
+ *
+ * OUTPUT:
+ *      ancora_status   : Status (i.e., whether errors arose)
+ *
+ * RUNTIME:
+ *      O(n*m*P*ANCORA_DEFAULT_PREC) where P = sum_b p_b (see
+ *      ancora_zonotope_batched_affine); one matmul dispatch for the
+ *      entire batch.
+ *
+ * Created:       2026-09-27
+ * Last modified: 2026-09-27
+ * Author(s):     Adrian Kulmburg
+ */
+{
+    if (res_batch == NULL) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer res_batch is NULL; it should point to a valid array of ancora_zonotope pointers.");
+    }
+    if (A == NULL) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer A is NULL; it should point to a valid ancora_mat instance.");
+    }
+    if (Z_batch == NULL) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer Z_batch is NULL; it should point to a valid array of ancora_zonotope pointers.");
+    }
+    if (B < 0) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "B is negative (%ld); it should be nonnegative.", (long)B);
+    }
+
+    slong n = A->nrows;
+    slong m = A->ncols;
+
+    if (B == 0) {
+        return ANCORA_OK; /* vacuously nothing to do */
+    }
+
+    slong *p = (slong *)malloc((size_t)B * sizeof(slong));
+    slong *offset = (slong *)malloc((size_t)B * sizeof(slong));
+    if (p == NULL || offset == NULL) {
+        free(p);
+        free(offset);
+        ANCORA_ERROR(ANCORA_ERROR_ALLOC, "ancora_zonotope_batched_matMul: failed to allocate per-pair bookkeeping arrays.");
+    }
+
+    ancora_status status = ANCORA_OK;
+    slong P = 0;
+
+    for (slong b = 0; b < B; b++) {
+        if (Z_batch[b] == NULL) {
+            status = ANCORA_ERROR_INVALID_ARG;
+            ANCORA_ERROR(status, "Pointer Z_batch[%ld] is NULL; it should point to a valid ancora_zonotope instance.", (long)b);
+        }
+        if (res_batch[b] == NULL) {
+            status = ANCORA_ERROR_INVALID_ARG;
+            ANCORA_ERROR(status, "Pointer res_batch[%ld] is NULL; it should point to a valid ancora_zonotope instance.", (long)b);
+        }
+        if (res_batch[b] == Z_batch[b]) {
+            ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "res_batch[%ld] must not alias Z_batch[%ld] for ancora_zonotope_batched_matMul.", (long)b, (long)b);
+        }
+
+        slong mZ, nRes, pRes;
+        ANCORA_TRY(ancora_zonotope_dimension(Z_batch[b], &mZ));
+        ANCORA_TRY(ancora_zonotope_dimension(res_batch[b], &nRes));
+        pRes = res_batch[b]->G.ncols;
+        p[b] = Z_batch[b]->G.ncols;
+
+        if (mZ != m) {
+            ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
+                          "Matrix A has %ld columns, Z_batch[%ld] has dimension %ld; they need to be the same.",
+                          (long)m, (long)b, (long)mZ);
+        }
+        if (nRes != n) {
+            ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
+                          "res_batch[%ld] should have dimension %ld, but has dimension %ld.",
+                          (long)b, (long)n, (long)nRes);
+        }
+        if (pRes != p[b]) {
+            ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
+                          "res_batch[%ld] should have %ld generators, but has %ld.",
+                          (long)b, (long)p[b], (long)pRes);
+        }
+
+        offset[b] = P;
+        P += p[b];
+    }
+
+    ancora_mat Combined, ResCombined;
+    bool CombinedInit = false, ResCombinedInit = false;
+
+    status = ancora_mat_init(&Combined, m, P + B);
+    if (status != ANCORA_OK) goto cleanup;
+    CombinedInit = true;
+    status = ancora_mat_init(&ResCombined, n, P + B);
+    if (status != ANCORA_OK) goto cleanup;
+    ResCombinedInit = true;
+
+    for (slong b = 0; b < B; b++) {
+        for (slong i = 0; i < m; i++) {
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+            arb_set(arb_mat_entry(Combined.repr, i, P + b), arb_mat_entry(Z_batch[b]->c.repr, i, 0));
+            for (slong j = 0; j < p[b]; j++) {
+                arb_set(arb_mat_entry(Combined.repr, i, offset[b] + j), arb_mat_entry(Z_batch[b]->G.repr, i, j));
+            }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+            Combined.repr[i * (P + B) + P + b] = Z_batch[b]->c.repr[i];
+            memcpy(&Combined.repr[i * (P + B) + offset[b]], &Z_batch[b]->G.repr[i * p[b]], (size_t)p[b] * sizeof(double));
+#endif
+        }
+    }
+
+    // ONE matmul for the entire batch (generators AND centers, no c to add).
+    status = ancora_mat_mul(&ResCombined, A, &Combined);
+    if (status != ANCORA_OK) goto cleanup;
+
+    for (slong b = 0; b < B; b++) {
+        for (slong i = 0; i < n; i++) {
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+            arb_set(arb_mat_entry(res_batch[b]->c.repr, i, 0), arb_mat_entry(ResCombined.repr, i, P + b));
+            for (slong j = 0; j < p[b]; j++) {
+                arb_set(arb_mat_entry(res_batch[b]->G.repr, i, j), arb_mat_entry(ResCombined.repr, i, offset[b] + j));
+            }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+            res_batch[b]->c.repr[i] = ResCombined.repr[i * (P + B) + P + b];
+            memcpy(&res_batch[b]->G.repr[i * p[b]], &ResCombined.repr[i * (P + B) + offset[b]], (size_t)p[b] * sizeof(double));
+#endif
+        }
+    }
+
+cleanup:
+    if (CombinedInit) ancora_mat_free(&Combined);
+    if (ResCombinedInit) ancora_mat_free(&ResCombined);
+    free(p);
+    free(offset);
+
+    if (status != ANCORA_OK) {
+        ANCORA_ERROR(status, "ancora_zonotope_batched_matMul: concatenation/matmul/slicing failed (see above).");
     }
     return ANCORA_OK;
 }

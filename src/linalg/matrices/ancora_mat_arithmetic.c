@@ -8,7 +8,7 @@
  * File Information
  * ----------------
  * Created:       2026-09-22
- * Last modified: 2026-09-22
+ * Last modified: 2026-09-27
  * Authors:       Adrian Kulmburg
  *
  * License
@@ -27,6 +27,18 @@
 
 #include "ancora/linalg/matrices/ancora_mat_arithmetic.h"
 
+/* Below this element count, the plain CPU loop is used even when
+ * ANCORA_USE_GPU is defined. add/sub/scalarMul/neg/transpose are all
+ * bandwidth-bound (roughly one FLOP per element moved), so for small-to-
+ * moderate matrices the two hipMemcpy round trips (host->device,
+ * device->host) cost more than the CPU loop itself -- unlike
+ * ancora_mat_mul, which is genuinely compute-bound (O(n*k*m) FLOPs on
+ * O(n*k + k*m) data) and so is always dispatched to the GPU when
+ * available, with no threshold. This value is a starting point, not a
+ * measured optimum -- tune it against your actual GPU/PCIe bandwidth and
+ * typical problem sizes if you have concrete benchmark numbers. */
+#define ANCORA_GPU_MIN_ELEMENTS 100000
+
 ancora_status ancora_mat_add(ancora_mat *res,
                              const ancora_mat *a,
                              const ancora_mat *b)
@@ -42,9 +54,13 @@ ancora_status ancora_mat_add(ancora_mat *res,
  * RUNTIME:
  *      O(n*m*ANCORA_DEFAULT_PREC)
  *      where n is the number of rows of a (or b), and m the number of columns.
+ *      In ANCORA_MODE_FAST with ANCORA_USE_GPU, only dispatched to the GPU
+ *      when n*m >= ANCORA_GPU_MIN_ELEMENTS; below that, the CPU loop is
+ *      used regardless, since this op's bandwidth-bound nature means the
+ *      GPU transfer round trip dominates for small/moderate sizes.
  *
  * Created:       2026-09-22
- * Last modified: 2026-09-22
+ * Last modified: 2026-09-27
  * Author(s):     Adrian Kulmburg
  */
 {
@@ -73,8 +89,14 @@ ancora_status ancora_mat_add(ancora_mat *res,
 #elif ANCORA_MODE == ANCORA_MODE_FAST
     size_t n = (size_t)(a->nrows * a->ncols);
     #ifdef ANCORA_USE_GPU
-        if (ancora_mat_add_gpu(a->repr, b->repr, res->repr, n) != 0) {
-            ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "GPU launch failed.");
+        if (n >= ANCORA_GPU_MIN_ELEMENTS) {
+            if (ancora_mat_add_gpu(a->repr, b->repr, res->repr, n) != 0) {
+                ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "GPU launch failed.");
+            }
+        } else {
+            for (size_t k = 0; k < n; k++) {
+                res->repr[k] = a->repr[k] + b->repr[k];
+            }
         }
     #else
         for (size_t k = 0; k < n; k++) {
@@ -100,9 +122,11 @@ ancora_status ancora_mat_sub(ancora_mat *res,
  * RUNTIME:
  *      O(n*m*ANCORA_DEFAULT_PREC)
  *      where n is the number of rows of a (or b), and m the number of columns.
+ *      In ANCORA_MODE_FAST with ANCORA_USE_GPU, only dispatched to the GPU
+ *      when n*m >= ANCORA_GPU_MIN_ELEMENTS (see ancora_mat_add).
  *
  * Created:       2026-09-24
- * Last modified: 2026-09-24
+ * Last modified: 2026-09-27
  * Author(s):     Adrian Kulmburg
  */
 {
@@ -134,8 +158,14 @@ ancora_status ancora_mat_sub(ancora_mat *res,
 #elif ANCORA_MODE == ANCORA_MODE_FAST
     size_t n = (size_t)(a->nrows * a->ncols);
     #ifdef ANCORA_USE_GPU
-        if (ancora_mat_sub_gpu(a->repr, b->repr, res->repr, n) != 0) {
-            ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "GPU launch failed.");
+        if (n >= ANCORA_GPU_MIN_ELEMENTS) {
+            if (ancora_mat_sub_gpu(a->repr, b->repr, res->repr, n) != 0) {
+                ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "GPU launch failed.");
+            }
+        } else {
+            for (size_t k = 0; k < n; k++) {
+                res->repr[k] = a->repr[k] - b->repr[k];
+            }
         }
     #else
         for (size_t k = 0; k < n; k++) {
@@ -167,9 +197,11 @@ ancora_status ancora_mat_scalarMul(ancora_mat *res,
  * RUNTIME:
  *      O(n*m*ANCORA_DEFAULT_PREC)
  *      where n is the number of rows of a and m the number of columns.
+ *      In ANCORA_MODE_FAST with ANCORA_USE_GPU, only dispatched to the GPU
+ *      when n*m >= ANCORA_GPU_MIN_ELEMENTS (see ancora_mat_add).
  *
  * Created:       2026-09-24
- * Last modified: 2026-09-24
+ * Last modified: 2026-09-27
  * Author(s):     Adrian Kulmburg
  */
 {
@@ -191,9 +223,18 @@ ancora_status ancora_mat_scalarMul(ancora_mat *res,
 #if ANCORA_MODE == ANCORA_MODE_SAFE
     arb_mat_scalar_mul_arb(res->repr, a->repr, scalar, ANCORA_DEFAULT_PREC);
 #elif ANCORA_MODE == ANCORA_MODE_FAST
+    size_t n = (size_t)(a->nrows * a->ncols);
     #ifdef ANCORA_USE_GPU
-        if (ancora_mat_scalarMul_gpu(a->repr, res->repr, scalar, (size_t)(a->nrows * a->ncols)) != 0) {
-            ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "GPU launch failed.");
+        if (n >= ANCORA_GPU_MIN_ELEMENTS) {
+            if (ancora_mat_scalarMul_gpu(a->repr, res->repr, scalar, n) != 0) {
+                ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "GPU launch failed.");
+            }
+        } else {
+            for (slong i = 0; i < a->nrows; i++) {
+                for (slong j = 0; j < a->ncols; j++) {
+                    res->repr[i * a->ncols + j] = scalar * a->repr[i * a->ncols + j];
+                }
+            }
         }
     #else
         for (slong i = 0; i < a->nrows; i++) {
@@ -221,10 +262,13 @@ ancora_status ancora_mat_mul(ancora_mat *res,
  * RUNTIME:
  *      O(n*k*m*ANCORA_DEFAULT_PREC)
  *      where n is the number of rows of a, k its number of columns, m the
- *      number of columns of b.
+ *      number of columns of b. Unlike add/sub/scalarMul/neg/transpose,
+ *      this is genuinely compute-bound (O(n*k*m) FLOPs on O(n*k + k*m)
+ *      data), so it is dispatched to the GPU whenever ANCORA_USE_GPU is
+ *      defined, with NO size threshold.
  *
  * Created:       2026-09-22
- * Last modified: 2026-09-22
+ * Last modified: 2026-09-27
  * Author(s):     Adrian Kulmburg
  */
 {
@@ -252,7 +296,7 @@ ancora_status ancora_mat_mul(ancora_mat *res,
                       (long)a->nrows, (long)b->ncols, (long)res->nrows, (long)res->ncols);
     }
     // res must be a distinct matrix from a and b: an in-place product isn't
-    // a simple entrywise operation like addition, so aliasing would silently
+    // a simple elementwise operation like addition, so aliasing would silently
     // corrupt intermediate sums. Reject it rather than producing a wrong
     // result.
     if (res == a || res == b) {
@@ -304,9 +348,14 @@ ancora_status ancora_mat_transpose(ancora_mat *res, const ancora_mat *a)
  *
  * RUNTIME:
  *      O(nrows*ncols*ANCORA_DEFAULT_PREC)
+ *      In ANCORA_MODE_FAST with ANCORA_USE_GPU, only dispatched to the GPU
+ *      when nrows*ncols >= ANCORA_GPU_MIN_ELEMENTS (see ancora_mat_add):
+ *      transpose is pure data movement (zero FLOPs), so it is at least as
+ *      bandwidth-bound as add/sub, and the same threshold reasoning
+ *      applies.
  *
  * Created:       2026-09-23
- * Last modified: 2026-09-23
+ * Last modified: 2026-09-27
  * Author(s):     Adrian Kulmburg
  */
 {
@@ -325,7 +374,7 @@ ancora_status ancora_mat_transpose(ancora_mat *res, const ancora_mat *a)
                       (long)a->ncols, (long)a->nrows, (long)res->nrows, (long)res->ncols);
     }
     /* res must be a distinct matrix from a: an in-place transpose is not a
-     * simple entrywise operation, so aliasing would corrupt the result. */
+     * simple elementwise operation, so aliasing would corrupt the result. */
     if (res == a) {
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "res must not alias a for ancora_mat_transpose.");
     }
@@ -337,9 +386,25 @@ ancora_status ancora_mat_transpose(ancora_mat *res, const ancora_mat *a)
         }
     }
 #elif ANCORA_MODE == ANCORA_MODE_FAST
+    size_t n = (size_t)(a->nrows * a->ncols);
     #ifdef ANCORA_USE_GPU
-        if (ancora_mat_transpose_gpu(a->repr, res->repr, a->nrows, a->ncols) != 0) {
-            ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "GPU launch failed.");
+        if (n >= ANCORA_GPU_MIN_ELEMENTS) {
+            if (ancora_mat_transpose_gpu(a->repr, res->repr, a->nrows, a->ncols) != 0) {
+                ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "GPU launch failed.");
+            }
+        } else {
+            #if defined(ANCORA_HAVE_CBLAS_DOMATCOPY)
+                cblas_domatcopy(CblasRowMajor, CblasTrans,
+                                (size_t)a->nrows, (size_t)a->ncols,
+                                1.0, a->repr, (size_t)a->ncols,
+                                res->repr, (size_t)a->nrows);
+            #else
+                for (slong i = 0; i < a->nrows; i++) {
+                    for (slong j = 0; j < a->ncols; j++) {
+                        res->repr[j * a->nrows + i] = a->repr[i * a->ncols + j];
+                    }
+                }
+            #endif
         }
     #elif defined(ANCORA_HAVE_CBLAS_DOMATCOPY)
         /* cblas_domatcopy is a widely-shipped BLAS extension (OpenBLAS,
@@ -375,9 +440,11 @@ ancora_status ancora_mat_neg(ancora_mat *res, const ancora_mat *a)
  *      O(nrows*ncols)
  *      In ANCORA_MODE_SAFE mode, negation is exact (no rounding), so this
  *      does not scale with ANCORA_DEFAULT_PREC.
+ *      In ANCORA_MODE_FAST with ANCORA_USE_GPU, only dispatched to the GPU
+ *      when nrows*ncols >= ANCORA_GPU_MIN_ELEMENTS (see ancora_mat_add).
  *
  * Created:       2026-09-25
- * Last modified: 2026-09-25
+ * Last modified: 2026-09-27
  * Author(s):     Adrian Kulmburg
  */
 {
@@ -399,13 +466,19 @@ ancora_status ancora_mat_neg(ancora_mat *res, const ancora_mat *a)
 #if ANCORA_MODE == ANCORA_MODE_SAFE
     arb_mat_neg(res->repr, a->repr);
 #elif ANCORA_MODE == ANCORA_MODE_FAST
-    slong n = a->nrows * a->ncols;
+    size_t n = (size_t)(a->nrows * a->ncols);
     #ifdef ANCORA_USE_GPU
-        if (ancora_mat_neg_gpu(a->repr, res->repr, (size_t)n) != 0) {
-            ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "GPU launch failed.");
+        if (n >= ANCORA_GPU_MIN_ELEMENTS) {
+            if (ancora_mat_neg_gpu(a->repr, res->repr, n) != 0) {
+                ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "GPU launch failed.");
+            }
+        } else {
+            for (size_t k = 0; k < n; k++) {
+                res->repr[k] = -a->repr[k];
+            }
         }
     #else
-        for (slong k = 0; k < n; k++) {
+        for (size_t k = 0; k < n; k++) {
             res->repr[k] = -a->repr[k];
         }
     #endif

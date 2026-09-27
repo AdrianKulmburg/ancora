@@ -188,6 +188,62 @@ ancora_status ancora_interval_batched_affine(
  * Author(s):     Adrian Kulmburg
  */
 
+ancora_status ancora_interval_matMul(ancora_interval *res,
+                                     const ancora_mat *A,
+                                     const ancora_interval *I);
+/* Matrix map of an interval, without translation: res = A*I = { A*x | x in I }.
+ * A is (n x m), I has dimension m, res has dimension n. Same computation
+ * as ancora_interval_affine with c omitted entirely (not even a zero
+ * vector is allocated).
+ *
+ * INPUT:
+ *      res             : Result interval, already initialized as dimension n
+ *      A               : Linear map (n x m)
+ *      I               : Interval to map (dimension m)
+ *
+ * OUTPUT:
+ *      ancora_status   : Status (i.e., whether errors arose)
+ *
+ * RUNTIME:
+ *      O(n*m*ANCORA_DEFAULT_PREC): one entrywise abs of A, two (n x m)*
+ *      (m x 1) mat-vec products (see ancora_interval_affine).
+ *
+ * Created:       2026-09-27
+ * Last modified: 2026-09-27
+ * Author(s):     Adrian Kulmburg
+ */
+
+
+ancora_status ancora_interval_batched_matMul(
+    ancora_interval **res_batch,
+    const ancora_mat *A,
+    const ancora_interval **I_batch,
+    slong B);
+/* Computes res_batch[b] = A*I_batch[b] for every b in [0, B) (no
+ * translation). A (n x m) is SHARED across the batch; only the intervals
+ * differ. Same as ancora_interval_batched_affine with c omitted.
+ *
+ * INPUT:
+ *      res_batch       : Array of B pointers, each already initialized
+ *                        with dimension n; res_batch[b] receives
+ *                        A*I_batch[b]
+ *      A               : Linear map (n x m), shared across the batch
+ *      I_batch         : Array of B pointers to initialized
+ *                        ancora_interval instances, all of dimension m
+ *      B               : Number of intervals in the batch (>= 0)
+ *
+ * OUTPUT:
+ *      ancora_status   : Status (i.e., whether errors arose)
+ *
+ * RUNTIME:
+ *      O(n*m*B*ANCORA_DEFAULT_PREC): two (n x m)*(m x B) matmuls plus one
+ *      O(n*m) entrywise abs of A (see ancora_interval_batched_affine).
+ *
+ * Created:       2026-09-27
+ * Last modified: 2026-09-27
+ * Author(s):     Adrian Kulmburg
+ */
+
 #ifdef __cplusplus
 }
 #endif

@@ -272,6 +272,16 @@ ancora_status ancora_interval_affine(ancora_interval *res,
 /* Affine map of an interval: res = A*I + c = { A*x + c | x in I }.
  * A is (n x m), I has dimension m, c has length n, and res has dimension n.
  *
+ * This does NOT build a dense (m x m) diagonal matrix B = diag(radius) and
+ * compute G = A*B via a full (n x m)*(m x m) matmul, as an earlier version
+ * of this function did -- that costs O(n*m^2), even though the ONLY use
+ * of G afterward was extracting each row's 1-norm, and
+ * (A*diag(radius))_ij = A_ij*radius_j means that row 1-norm is exactly
+ * sum_j |A_ij|*radius_j = (|A|*radius)_i -- a plain (n x m)*(m x 1)
+ * matrix-vector product, O(n*m), with no diagonal matrix or G ever
+ * needed. This is the same realization ancora_interval_batched_affine
+ * already made (R = |A|*Rad); this function now matches it.
+ *
  * INPUT:
  *      res             : Result interval, already initialized as dimension n
  *      A               : Linear map (n x m)
@@ -282,14 +292,15 @@ ancora_status ancora_interval_affine(ancora_interval *res,
  *      ancora_status   : Status (i.e., whether errors arose)
  *
  * RUNTIME:
- *      O(n*m*ANCORA_DEFAULT_PREC)
+ *      O(n*m*ANCORA_DEFAULT_PREC): one entrywise abs of A, two (n x m)*
+ *      (m x 1) mat-vec products (A*d and |A|*radius), versus
+ *      O(n*m^2*ANCORA_DEFAULT_PREC) for the previous B/G-based version.
  *
  * Created:       2026-09-25
- * Last modified: 2026-09-25
+ * Last modified: 2026-09-27
  * Author(s):     Adrian Kulmburg
  */
 {
-    // Check that each quantity has been initialized
     if (res == NULL) {
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer res is NULL; it should point to a valid ancora_interval instance.");
     }
@@ -303,11 +314,9 @@ ancora_status ancora_interval_affine(ancora_interval *res,
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer I is NULL; it should point to a valid ancora_interval instance.");
     }
 
-    // Verify that c is a vector
     bool isVector;
     ANCORA_TRY(ancora_mat_isVector(c, &isVector));
-    if (!isVector)
-    {
+    if (!isVector) {
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer c is not a vector; it should point to a valid ancora_vec instance.");
     }
 
@@ -319,7 +328,6 @@ ancora_status ancora_interval_affine(ancora_interval *res,
     slong res_dimension;
     ANCORA_TRY(ancora_interval_dimension(res, &res_dimension));
 
-    // Dimension checks
     if (I_dimension != m) {
         ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
                       "Matrix A has %ld columns, interval I has dimension %ld; they need to be the same.",
@@ -335,26 +343,13 @@ ancora_status ancora_interval_affine(ancora_interval *res,
                       "Result should have dimension %ld, but res has dimension %ld.",
                       (long)n, (long)res_dimension);
     }
-    // res must be a distinct interval from I: the affine map is not an
-    // elementwise operation, so aliasing would corrupt the result.
     if (res == I) {
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "res must not alias I for ancora_interval_affine.");
     }
 
-    /* We can now perform the actual computation. The idea is that
-     * A*I + c = { A*x + c | x in I }
-     * is just a zonotope at the end of the day, so that it suffices to enclose
-     * that zonotope with a box.
-     * Now, to enclose with a box, one basically needs to know 'how far the set
-     * goes' in each direction. This is equivalent to computing the support
-     * function of the zonotope in each direction +-e_i, where e_i is the i-th
-     * canonical basis vector of R^n.
-     */
-
-    /* Of course, this whole ordeal only works if I is bounded; if that is not
-     * the case, the easiest way around is to use polytopes I guess, but this
-     * will be implemented later.
-     */
+    /* This whole ordeal only works if I is bounded; if not, the easiest
+     * way around is to use polytopes I guess, but this will be
+     * implemented later. */
 #if ANCORA_MODE == ANCORA_MODE_SAFE
     for (slong j = 0; j < m; j++) {
         if (!arb_is_finite(arb_mat_entry(I->lowerBound.repr, j, 0)) ||
@@ -375,98 +370,54 @@ ancora_status ancora_interval_affine(ancora_interval *res,
     }
 #endif
 
-    /* So, the first step is to find a diagonal matrix B and a vector d such
-     * that I = B*[-1,1]^m+d. This is basically the same as computing the
-     * 'radius' and center of the interval.
-     */
-
-    ancora_vec d, radius;
-
+    ancora_vec d, radius, e, r;
+    ancora_mat absA;
     ANCORA_TRY(ancora_vec_init(&d, m));
     ANCORA_TRY(ancora_vec_init(&radius, m));
+    ANCORA_TRY(ancora_vec_init(&e, n));
+    ANCORA_TRY(ancora_vec_init(&r, n));
+    ANCORA_TRY(ancora_mat_init(&absA, n, m));
 
-    // center = (lowerBound + upperBound) / 2
+    // d = (lowerBound + upperBound) / 2 ; radius = (upperBound - lowerBound) / 2
     ANCORA_TRY(ancora_vec_add(&d, &I->lowerBound, &I->upperBound));
+    // absA = |A|, computed once, needed for the radius mapping below.
 #if ANCORA_MODE == ANCORA_MODE_SAFE
     arb_t half;
     arb_init(half);
     arb_set_d(half, 0.5);
     ANCORA_TRY(ancora_vec_scalarMul(&d, &d, half));
-#elif ANCORA_MODE == ANCORA_MODE_FAST
-    ANCORA_TRY(ancora_vec_scalarMul(&d, &d, 0.5));
-#endif
-
-    // radius = (upperBound - lowerBound) / 2
     ANCORA_TRY(ancora_vec_sub(&radius, &I->upperBound, &I->lowerBound));
-#if ANCORA_MODE == ANCORA_MODE_SAFE
     ANCORA_TRY(ancora_vec_scalarMul(&radius, &radius, half));
     arb_clear(half);
-#elif ANCORA_MODE == ANCORA_MODE_FAST
-    ANCORA_TRY(ancora_vec_scalarMul(&radius, &radius, 0.5));
-#endif
-
-    // Construct B
-    ancora_mat B;
-    ANCORA_TRY(ancora_mat_init(&B, m, m));
-    ANCORA_TRY(ancora_mat_vecDiag(&B, &radius));
-
-    /* So, the final zonotope has the form
-     * A*B*[-1,1]^m + A*d + c
-     * which can be brought in the form
-     * G*[-1,1]^m + e
-     * for further, faster processing. So we need to compute G and e.
-     */
-    ancora_mat G;
-    ancora_vec e;
-    ANCORA_TRY(ancora_mat_init(&G, n, m));
-    ANCORA_TRY(ancora_vec_init(&e, n));
-
-    ancora_vec Ad;
-    ANCORA_TRY(ancora_vec_init(&Ad, n));
-
-    // Compute G
-    ANCORA_TRY(ancora_mat_mul(&G, A, &B));
-
-    // Compute A*d TODO: Replace this someday by a mat-vec multiplication function
-    ANCORA_TRY(ancora_mat_mul(&Ad, A, &d));
-
-    // Compute e
-    ANCORA_TRY(ancora_vec_add(&e, &Ad, c));
-
-    // Compute the bounds now
-    ancora_vec r, row;
-    ANCORA_TRY(ancora_vec_init(&r, n));
-    ANCORA_TRY(ancora_vec_init(&row, m));
-
     for (slong i = 0; i < n; i++) {
-        /* Copy row i of G into the reusable `row` vector - G is
-         * row-major, so this is a contiguous read in ANCORA_MODE_FAST
-         * and a simple per-entry arb_set loop in ANCORA_MODE_SAFE,
-         * mirroring how ancora_mat_transpose accesses entries. */
-#if ANCORA_MODE == ANCORA_MODE_SAFE
         for (slong j = 0; j < m; j++) {
-            arb_set(arb_mat_entry(row.repr, j, 0), arb_mat_entry(G.repr, i, j));
+            arb_abs(arb_mat_entry(absA.repr, i, j), arb_mat_entry(A->repr, i, j));
         }
-        ANCORA_TRY(ancora_vec_1norm(arb_mat_entry(r.repr, i, 0), &row));
-#elif ANCORA_MODE == ANCORA_MODE_FAST
-        memcpy(row.repr, &G.repr[i * m], (size_t)m * sizeof(double));
-        ANCORA_TRY(ancora_vec_1norm(&r.repr[i], &row));
-#endif
     }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+    ANCORA_TRY(ancora_vec_scalarMul(&d, &d, 0.5));
+    ANCORA_TRY(ancora_vec_sub(&radius, &I->upperBound, &I->lowerBound));
+    ANCORA_TRY(ancora_vec_scalarMul(&radius, &radius, 0.5));
+    for (slong i = 0; i < n * m; i++) {
+        absA.repr[i] = fabs(A->repr[i]);
+    }
+#endif
+
+    // e = A*d + c (mat-vec, O(n*m))
+    ANCORA_TRY(ancora_mat_mul(&e, A, &d));
+    ANCORA_TRY(ancora_vec_add(&e, &e, c));
+    // r = |A|*radius (mat-vec, O(n*m)) -- this replaces the old per-row
+    // extraction of G plus ancora_vec_1norm calls entirely.
+    ANCORA_TRY(ancora_mat_mul(&r, &absA, &radius));
 
     ANCORA_TRY(ancora_vec_sub(&res->lowerBound, &e, &r));
     ANCORA_TRY(ancora_vec_add(&res->upperBound, &e, &r));
 
-    // Free all temporary variables
-    ANCORA_TRY(ancora_mat_free(&B));
-    ANCORA_TRY(ancora_mat_free(&G));
-
     ANCORA_TRY(ancora_vec_free(&d));
     ANCORA_TRY(ancora_vec_free(&radius));
-    ANCORA_TRY(ancora_vec_free(&Ad));
     ANCORA_TRY(ancora_vec_free(&e));
     ANCORA_TRY(ancora_vec_free(&r));
-    ANCORA_TRY(ancora_vec_free(&row));
+    ANCORA_TRY(ancora_mat_free(&absA));
 
     return ANCORA_OK;
 }
@@ -679,6 +630,295 @@ ancora_status ancora_interval_batched_affine(
             double ci = c->repr[i];
             res_batch[b]->lowerBound.repr[i] = Eib + ci - Rib;
             res_batch[b]->upperBound.repr[i] = Eib + ci + Rib;
+#endif
+        }
+    }
+
+    ANCORA_TRY(ancora_mat_free(&absA));
+    ANCORA_TRY(ancora_mat_free(&D));
+    ANCORA_TRY(ancora_mat_free(&Rad));
+    ANCORA_TRY(ancora_mat_free(&E));
+    ANCORA_TRY(ancora_mat_free(&R));
+
+    return ANCORA_OK;
+}
+
+ancora_status ancora_interval_matMul(ancora_interval *res,
+                                     const ancora_mat *A,
+                                     const ancora_interval *I)
+/* Matrix map of an interval, without translation: res = A*I = { A*x | x in I }.
+ * A is (n x m), I has dimension m, res has dimension n. Same computation
+ * as ancora_interval_affine with c omitted entirely (not even a zero
+ * vector is allocated).
+ *
+ * INPUT:
+ *      res             : Result interval, already initialized as dimension n
+ *      A               : Linear map (n x m)
+ *      I               : Interval to map (dimension m)
+ *
+ * OUTPUT:
+ *      ancora_status   : Status (i.e., whether errors arose)
+ *
+ * RUNTIME:
+ *      O(n*m*ANCORA_DEFAULT_PREC): one entrywise abs of A, two (n x m)*
+ *      (m x 1) mat-vec products (see ancora_interval_affine).
+ *
+ * Created:       2026-09-27
+ * Last modified: 2026-09-27
+ * Author(s):     Adrian Kulmburg
+ */
+{
+    if (res == NULL) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer res is NULL; it should point to a valid ancora_interval instance.");
+    }
+    if (A == NULL) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer A is NULL; it should point to a valid ancora_mat instance.");
+    }
+    if (I == NULL) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer I is NULL; it should point to a valid ancora_interval instance.");
+    }
+
+    slong n = A->nrows;
+    slong m = A->ncols;
+
+    slong I_dimension;
+    ANCORA_TRY(ancora_interval_dimension(I, &I_dimension));
+    slong res_dimension;
+    ANCORA_TRY(ancora_interval_dimension(res, &res_dimension));
+
+    if (I_dimension != m) {
+        ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
+                      "Matrix A has %ld columns, interval I has dimension %ld; they need to be the same.",
+                      (long)m, (long)I_dimension);
+    }
+    if (res_dimension != n) {
+        ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
+                      "Result should have dimension %ld, but res has dimension %ld.",
+                      (long)n, (long)res_dimension);
+    }
+    if (res == I) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "res must not alias I for ancora_interval_matMul.");
+    }
+
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+    for (slong j = 0; j < m; j++) {
+        if (!arb_is_finite(arb_mat_entry(I->lowerBound.repr, j, 0)) ||
+            !arb_is_finite(arb_mat_entry(I->upperBound.repr, j, 0))) {
+            ANCORA_ERROR(ANCORA_ERROR_NOT_IMPLEMENTED,
+                          "Unbounded interval bounds (component %ld) are not yet supported.",
+                          (long)j);
+        }
+    }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+    for (slong j = 0; j < m; j++) {
+        if (isinf(I->lowerBound.repr[j]) || isnan(I->lowerBound.repr[j]) ||
+            isinf(I->upperBound.repr[j]) || isnan(I->upperBound.repr[j])) {
+            ANCORA_ERROR(ANCORA_ERROR_NOT_IMPLEMENTED,
+                          "Unbounded interval bounds (component %ld) are not yet supported.",
+                          (long)j);
+        }
+    }
+#endif
+
+    ancora_vec d, radius, e, r;
+    ancora_mat absA;
+    ANCORA_TRY(ancora_vec_init(&d, m));
+    ANCORA_TRY(ancora_vec_init(&radius, m));
+    ANCORA_TRY(ancora_vec_init(&e, n));
+    ANCORA_TRY(ancora_vec_init(&r, n));
+    ANCORA_TRY(ancora_mat_init(&absA, n, m));
+
+    ANCORA_TRY(ancora_vec_add(&d, &I->lowerBound, &I->upperBound));
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+    arb_t half;
+    arb_init(half);
+    arb_set_d(half, 0.5);
+    ANCORA_TRY(ancora_vec_scalarMul(&d, &d, half));
+    ANCORA_TRY(ancora_vec_sub(&radius, &I->upperBound, &I->lowerBound));
+    ANCORA_TRY(ancora_vec_scalarMul(&radius, &radius, half));
+    arb_clear(half);
+    for (slong i = 0; i < n; i++) {
+        for (slong j = 0; j < m; j++) {
+            arb_abs(arb_mat_entry(absA.repr, i, j), arb_mat_entry(A->repr, i, j));
+        }
+    }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+    ANCORA_TRY(ancora_vec_scalarMul(&d, &d, 0.5));
+    ANCORA_TRY(ancora_vec_sub(&radius, &I->upperBound, &I->lowerBound));
+    ANCORA_TRY(ancora_vec_scalarMul(&radius, &radius, 0.5));
+    for (slong i = 0; i < n * m; i++) {
+        absA.repr[i] = fabs(A->repr[i]);
+    }
+#endif
+
+    // e = A*d (no c to add here)
+    ANCORA_TRY(ancora_mat_mul(&e, A, &d));
+    ANCORA_TRY(ancora_mat_mul(&r, &absA, &radius));
+
+    ANCORA_TRY(ancora_vec_sub(&res->lowerBound, &e, &r));
+    ANCORA_TRY(ancora_vec_add(&res->upperBound, &e, &r));
+
+    ANCORA_TRY(ancora_vec_free(&d));
+    ANCORA_TRY(ancora_vec_free(&radius));
+    ANCORA_TRY(ancora_vec_free(&e));
+    ANCORA_TRY(ancora_vec_free(&r));
+    ANCORA_TRY(ancora_mat_free(&absA));
+
+    return ANCORA_OK;
+}
+
+ancora_status ancora_interval_batched_matMul(
+    ancora_interval **res_batch,
+    const ancora_mat *A,
+    const ancora_interval **I_batch,
+    slong B)
+/* Computes res_batch[b] = A*I_batch[b] for every b in [0, B) (no
+ * translation). A (n x m) is SHARED across the batch; only the intervals
+ * differ. Same as ancora_interval_batched_affine with c omitted.
+ *
+ * INPUT:
+ *      res_batch       : Array of B pointers, each already initialized
+ *                        with dimension n; res_batch[b] receives
+ *                        A*I_batch[b]
+ *      A               : Linear map (n x m), shared across the batch
+ *      I_batch         : Array of B pointers to initialized
+ *                        ancora_interval instances, all of dimension m
+ *      B               : Number of intervals in the batch (>= 0)
+ *
+ * OUTPUT:
+ *      ancora_status   : Status (i.e., whether errors arose)
+ *
+ * RUNTIME:
+ *      O(n*m*B*ANCORA_DEFAULT_PREC): two (n x m)*(m x B) matmuls plus one
+ *      O(n*m) entrywise abs of A (see ancora_interval_batched_affine).
+ *
+ * Created:       2026-09-27
+ * Last modified: 2026-09-27
+ * Author(s):     Adrian Kulmburg
+ */
+{
+    if (res_batch == NULL) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer res_batch is NULL; it should point to a valid array of ancora_interval pointers.");
+    }
+    if (A == NULL) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer A is NULL; it should point to a valid ancora_mat instance.");
+    }
+    if (I_batch == NULL) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer I_batch is NULL; it should point to a valid array of ancora_interval pointers.");
+    }
+    if (B < 0) {
+        ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "B is negative (%ld); it should be nonnegative.", (long)B);
+    }
+
+    slong n = A->nrows;
+    slong m = A->ncols;
+
+    if (B == 0) {
+        return ANCORA_OK; /* vacuously nothing to do */
+    }
+
+    for (slong b = 0; b < B; b++) {
+        if (I_batch[b] == NULL) {
+            ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer I_batch[%ld] is NULL; it should point to a valid ancora_interval instance.", (long)b);
+        }
+        if (res_batch[b] == NULL) {
+            ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer res_batch[%ld] is NULL; it should point to a valid ancora_interval instance.", (long)b);
+        }
+        slong Ib_dim, resB_dim;
+        ANCORA_TRY(ancora_interval_dimension(I_batch[b], &Ib_dim));
+        ANCORA_TRY(ancora_interval_dimension(res_batch[b], &resB_dim));
+        if (Ib_dim != m) {
+            ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
+                          "Matrix A has %ld columns, I_batch[%ld] has dimension %ld; they need to be the same.",
+                          (long)m, (long)b, (long)Ib_dim);
+        }
+        if (resB_dim != n) {
+            ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
+                          "res_batch[%ld] should have dimension %ld, but has dimension %ld.",
+                          (long)b, (long)n, (long)resB_dim);
+        }
+        if (res_batch[b] == I_batch[b]) {
+            ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "res_batch[%ld] must not alias I_batch[%ld] for ancora_interval_batched_matMul.", (long)b, (long)b);
+        }
+
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+        for (slong j = 0; j < m; j++) {
+            if (!arb_is_finite(arb_mat_entry(I_batch[b]->lowerBound.repr, j, 0)) ||
+                !arb_is_finite(arb_mat_entry(I_batch[b]->upperBound.repr, j, 0))) {
+                ANCORA_ERROR(ANCORA_ERROR_NOT_IMPLEMENTED,
+                              "I_batch[%ld]: unbounded interval bounds (component %ld) are not yet supported.",
+                              (long)b, (long)j);
+            }
+        }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+        for (slong j = 0; j < m; j++) {
+            if (isinf(I_batch[b]->lowerBound.repr[j]) || isnan(I_batch[b]->lowerBound.repr[j]) ||
+                isinf(I_batch[b]->upperBound.repr[j]) || isnan(I_batch[b]->upperBound.repr[j])) {
+                ANCORA_ERROR(ANCORA_ERROR_NOT_IMPLEMENTED,
+                              "I_batch[%ld]: unbounded interval bounds (component %ld) are not yet supported.",
+                              (long)b, (long)j);
+            }
+        }
+#endif
+    }
+
+    ancora_mat absA, D, Rad, E, R;
+    ANCORA_TRY(ancora_mat_init(&absA, n, m));
+    ANCORA_TRY(ancora_mat_init(&D, m, B));
+    ANCORA_TRY(ancora_mat_init(&Rad, m, B));
+    ANCORA_TRY(ancora_mat_init(&E, n, B));
+    ANCORA_TRY(ancora_mat_init(&R, n, B));
+
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+    for (slong i = 0; i < n; i++) {
+        for (slong j = 0; j < m; j++) {
+            arb_abs(arb_mat_entry(absA.repr, i, j), arb_mat_entry(A->repr, i, j));
+        }
+    }
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+    for (slong i = 0; i < n * m; i++) {
+        absA.repr[i] = fabs(A->repr[i]);
+    }
+#endif
+
+    for (slong b = 0; b < B; b++) {
+        for (slong j = 0; j < m; j++) {
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+            arb_ptr lb = arb_mat_entry(I_batch[b]->lowerBound.repr, j, 0);
+            arb_ptr ub = arb_mat_entry(I_batch[b]->upperBound.repr, j, 0);
+            arb_ptr Dje = arb_mat_entry(D.repr, j, b);
+            arb_ptr Rje = arb_mat_entry(Rad.repr, j, b);
+            arb_add(Dje, lb, ub, ANCORA_DEFAULT_PREC);
+            arb_mul_2exp_si(Dje, Dje, -1);
+            arb_sub(Rje, ub, lb, ANCORA_DEFAULT_PREC);
+            arb_mul_2exp_si(Rje, Rje, -1);
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+            double lb = I_batch[b]->lowerBound.repr[j];
+            double ub = I_batch[b]->upperBound.repr[j];
+            D.repr[j * B + b] = (lb + ub) * 0.5;
+            Rad.repr[j * B + b] = (ub - lb) * 0.5;
+#endif
+        }
+    }
+
+    // No c to add: res_batch[b]->lowerBound = E[:,b] - R[:,b], upperBound = E[:,b] + R[:,b]
+    ANCORA_TRY(ancora_mat_mul(&E, A, &D));
+    ANCORA_TRY(ancora_mat_mul(&R, &absA, &Rad));
+
+    for (slong b = 0; b < B; b++) {
+        for (slong i = 0; i < n; i++) {
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+            arb_ptr Eib = arb_mat_entry(E.repr, i, b);
+            arb_ptr Rib = arb_mat_entry(R.repr, i, b);
+            arb_ptr lo = arb_mat_entry(res_batch[b]->lowerBound.repr, i, 0);
+            arb_ptr hi = arb_mat_entry(res_batch[b]->upperBound.repr, i, 0);
+            arb_sub(lo, Eib, Rib, ANCORA_DEFAULT_PREC);
+            arb_add(hi, Eib, Rib, ANCORA_DEFAULT_PREC);
+#elif ANCORA_MODE == ANCORA_MODE_FAST
+            double Eib = E.repr[i * B + b];
+            double Rib = R.repr[i * B + b];
+            res_batch[b]->lowerBound.repr[i] = Eib - Rib;
+            res_batch[b]->upperBound.repr[i] = Eib + Rib;
 #endif
         }
     }
