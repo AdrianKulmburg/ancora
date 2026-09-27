@@ -1,56 +1,46 @@
-# Top-level CMakeLists.txt for the ancora library.
+# ============================================================================
+# Top-level CMakeLists.txt for the ancora library
+# ============================================================================
 #
 # Build flavors:
 #
 #   SAFE:
 #       -DANCORA_MODE_SAFE=ON
-#       -> libancora
+#       -> libancora.a
 #       -> FLINT/ARB
 #
 #   FAST:
 #       -DANCORA_MODE_SAFE=OFF
-#       -> libancora_fast
+#       -> libancora_fast.a
 #       -> BLAS + HiGHS
 #
-#   FAST + GPU:
+#   FAST + NVIDIA GPU:
 #       -DANCORA_MODE_SAFE=OFF
 #       -DANCORA_USE_GPU=ON
-#       -> libancora_fast_gpu
-#       -> HIP + hipBLAS + HiGHS
+#       -DANCORA_GPU_PLATFORM=nvidia
+#       -> libancora_fast_gpu.a
+#       -> HIP-over-CUDA + hipBLAS + HiGHS
 #
-# IMPORTANT:
-# ANCORA_MODE_SAFE is a CMake option. It is NOT passed as a compiler
-# definition. The source code uses ANCORA_MODE, whose values are defined
-# by ancora_config.h:
+# SAFE and FAST are ABI-incompatible and must never be mixed.
 #
-#     ANCORA_MODE_SAFE = 0
-#     ANCORA_MODE_FAST = 1
+# GPU is only supported with FAST mode.
 #
-# Therefore we pass:
+# For NVIDIA/HIP builds, ANCORA_HIP_ARCHITECTURES must be known BEFORE
+# enable_language(HIP), because CMake needs it while initializing HIP.
 #
-#     ANCORA_MODE=ANCORA_MODE_SAFE
+# Example for NVIDIA A100:
 #
-# or:
+#   -DANCORA_GPU_PLATFORM=nvidia
+#   -DANCORA_HIP_ARCHITECTURES=80
 #
-#     ANCORA_MODE=ANCORA_MODE_FAST
-#
-# SAFE and FAST are ABI-incompatible and must never be mixed in one process.
-#
-# GPU is a separate axis. It is only supported with FAST mode.
-# The GPU implementation is written once in HIP and can target:
-#
-#     ANCORA_GPU_PLATFORM=amd
-#     ANCORA_GPU_PLATFORM=nvidia
-#
-# ---------------------------------------------------------------------------
-
+# ============================================================================
 
 cmake_minimum_required(VERSION 3.21)
 
 
-# ===========================================================================
-# User options
-# ===========================================================================
+# ============================================================================
+# Options
+# ============================================================================
 
 option(
     ANCORA_MODE_SAFE
@@ -60,7 +50,7 @@ option(
 
 option(
     ANCORA_USE_GPU
-    "Build the FAST flavor with the HIP GPU implementation"
+    "Build the FAST flavor with HIP GPU support"
     OFF
 )
 
@@ -68,7 +58,7 @@ set(
     ANCORA_GPU_PLATFORM
     "amd"
     CACHE STRING
-    "GPU platform for HIP: 'amd' or 'nvidia'"
+    "GPU platform: amd or nvidia"
 )
 
 set_property(
@@ -80,43 +70,50 @@ set(
     ANCORA_HIP_ARCHITECTURES
     ""
     CACHE STRING
-    "HIP GPU architecture(s), e.g. gfx90a or 80"
+    "HIP GPU architecture(s), e.g. gfx90a for AMD or 80 for NVIDIA A100"
+)
+
+set(
+    ANCORA_ROCM_ROOT
+    "/opt/rocm"
+    CACHE PATH
+    "ROCm/HIP installation root"
 )
 
 
-# ===========================================================================
+# ============================================================================
 # Validate options
-# ===========================================================================
+# ============================================================================
 
-if(NOT ANCORA_GPU_PLATFORM STREQUAL "amd"
-   AND NOT ANCORA_GPU_PLATFORM STREQUAL "nvidia")
-
+if(
+    NOT ANCORA_GPU_PLATFORM STREQUAL "amd"
+    AND NOT ANCORA_GPU_PLATFORM STREQUAL "nvidia"
+)
     message(
         FATAL_ERROR
         "ANCORA_GPU_PLATFORM must be either 'amd' or 'nvidia'. "
         "Got '${ANCORA_GPU_PLATFORM}'."
     )
-
 endif()
 
 
 if(ANCORA_USE_GPU AND ANCORA_MODE_SAFE)
-
     message(
         FATAL_ERROR
-        "ANCORA_USE_GPU=ON requires ANCORA_MODE_SAFE=OFF. "
-        "There is no GPU-accelerated FLINT/ARB path."
+        "ANCORA_USE_GPU=ON requires ANCORA_MODE_SAFE=OFF."
     )
-
 endif()
 
 
-# ===========================================================================
-# HIP platform selection
+# ============================================================================
+# GPU/HIP environment
+# ============================================================================
 #
-# ROCm's hip package looks at HIP_PLATFORM. Set it before project() so that
-# the HIP/ROCm CMake machinery sees the correct platform.
-# ===========================================================================
+# HIP's package configuration uses HIP_PLATFORM.
+#
+# This must be established before the HIP package is found and before HIP
+# language support is initialized.
+# ============================================================================
 
 if(ANCORA_USE_GPU)
 
@@ -126,14 +123,27 @@ if(ANCORA_USE_GPU)
         set(ENV{HIP_PLATFORM} "amd")
     endif()
 
+    message(
+        STATUS
+        "ancora: GPU platform = ${ANCORA_GPU_PLATFORM}"
+    )
+
+    message(
+        STATUS
+        "ancora: ROCm root = ${ANCORA_ROCM_ROOT}"
+    )
+
 endif()
 
 
-# ===========================================================================
+# ============================================================================
 # Project
-# ===========================================================================
+# ============================================================================
+#
+# CMake's native HIP language support is enabled later, after the HIP package
+# has been found and the architecture has been established.
+# ============================================================================
 
-# The project only needs C unless the GPU implementation is enabled.
 if(ANCORA_USE_GPU)
     project(ancora C CXX)
 else()
@@ -145,11 +155,10 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 
-# ===========================================================================
+# ============================================================================
 # Custom CMake modules
-# ===========================================================================
+# ============================================================================
 
-# FindFLINT.cmake and FindHIGHS.cmake live here.
 list(
     APPEND
     CMAKE_MODULE_PATH
@@ -157,13 +166,9 @@ list(
 )
 
 
-# ===========================================================================
-# Dependencies
-# ===========================================================================
-
-# ---------------------------------------------------------------------------
-# SAFE mode
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Dependencies: SAFE
+# ============================================================================
 
 if(ANCORA_MODE_SAFE)
 
@@ -172,75 +177,66 @@ if(ANCORA_MODE_SAFE)
 endif()
 
 
-# ---------------------------------------------------------------------------
-# FAST mode
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Dependencies: FAST
+# ============================================================================
 
 if(NOT ANCORA_MODE_SAFE)
 
-    # HiGHS is required by the FAST zonotope containment implementation.
     find_package(HIGHS REQUIRED)
 
 endif()
 
 
-# ---------------------------------------------------------------------------
-# GPU mode
-# ---------------------------------------------------------------------------
+# ============================================================================
+# GPU dependency setup
+# ============================================================================
 #
-# ROCm's packages are normally installed under:
+# Important:
 #
-#     /opt/rocm/
+#   find_package(hip)
+#   MUST happen before find_package(hipblas)
 #
-# which may itself be a symlink to something such as:
-#
-#     /opt/rocm-6.2.2/
-#
-# ANCORA_ROCM_ROOT can be overridden with:
-#
-#     -DANCORA_ROCM_ROOT=/some/other/rocm
-#
-# We deliberately find HIP and hipBLAS exactly once here.
-# In particular, do NOT call find_package(hipblas) again later.
-# ---------------------------------------------------------------------------
+# because roc::hipblas has a dependency on hip::host.
+# ============================================================================
 
 if(ANCORA_USE_GPU)
 
-    set(
-        ANCORA_ROCM_ROOT
-        "/opt/rocm"
-        CACHE PATH
-        "Root directory of the ROCm installation"
-    )
-
-    message(
-        STATUS
-        "ancora: ROCm root = ${ANCORA_ROCM_ROOT}"
-    )
-
-    message(
-        STATUS
-        "ancora: GPU platform = ${ANCORA_GPU_PLATFORM}"
-    )
+    # ------------------------------------------------------------------------
+    # Make ROCm packages discoverable.
+    # ------------------------------------------------------------------------
 
     list(
-        APPEND CMAKE_PREFIX_PATH
+        APPEND
+        CMAKE_PREFIX_PATH
         "${ANCORA_ROCM_ROOT}"
         "${ANCORA_ROCM_ROOT}/lib/cmake"
     )
 
+    # Some ROCm installations use versioned directories such as:
+    #
+    #   /opt/rocm-6.3.1
+    #
+    # while /opt/rocm may be a symlink.
+    #
+    file(
+        GLOB
+        ANCORA_ROCM_VERSIONED_DIRS
+        "/opt/rocm-*"
+    )
+
+    if(ANCORA_ROCM_VERSIONED_DIRS)
+        list(
+            APPEND
+            CMAKE_PREFIX_PATH
+            ${ANCORA_ROCM_VERSIONED_DIRS}
+        )
+    endif()
 
 
-    # -----------------------------------------------------------------------
-    # HIP package
-    #
-    # This package is responsible for providing targets such as:
-    #
-    #     hip::host
-    #     hip::device
-    #
-    # hipBLAS depends on hip::host, so HIP must be found before hipBLAS.
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # HIP
+    # ------------------------------------------------------------------------
 
     find_package(
         hip
@@ -252,12 +248,13 @@ if(ANCORA_USE_GPU)
     )
 
 
-    # -----------------------------------------------------------------------
-    # hipBLAS package
+    # ------------------------------------------------------------------------
+    # hipBLAS
+    # ------------------------------------------------------------------------
     #
-    # roc::hipblas depends on hip::host, which was provided by find_package
-    # above.
-    # -----------------------------------------------------------------------
+    # HIP is intentionally found first because hipBLAS's imported targets
+    # depend on hip::host.
+    # ------------------------------------------------------------------------
 
     find_package(
         hipblas
@@ -269,58 +266,76 @@ if(ANCORA_USE_GPU)
     )
 
 
-    # -----------------------------------------------------------------------
-    # HIP platform
+    # ------------------------------------------------------------------------
+    # Determine HIP architecture BEFORE enabling HIP
+    # ------------------------------------------------------------------------
     #
-    # CMake versions that support CMAKE_HIP_PLATFORM use this to select the
-    # backend. HIP_PLATFORM above is also set because ROCm's own package
-    # machinery uses it.
-    # -----------------------------------------------------------------------
-
-    set(
-        CMAKE_HIP_PLATFORM
-        "${ANCORA_GPU_PLATFORM}"
-    )
-
-
-    # -----------------------------------------------------------------------
-    # Enable CMake's native HIP language support.
+    # For NVIDIA, the install script should normally pass:
     #
-    # Do NOT set CMAKE_HIP_COMPILER to hipcc. CMake's HIP support expects
-    # the underlying compiler (normally ROCm's clang).
-    # -----------------------------------------------------------------------
+    #     -DANCORA_HIP_ARCHITECTURES=80
+    #
+    # for an A100.
+    #
+    # If it wasn't provided, use a conservative NVIDIA default of 80.
+    # ------------------------------------------------------------------------
 
-    set(CMAKE_HIP_PLATFORM "${ANCORA_GPU_PLATFORM}")
-
-    if(ANCORA_HIP_ARCHITECTURES)
-        set(
-            CMAKE_HIP_ARCHITECTURES
-            "${ANCORA_HIP_ARCHITECTURES}"
-            CACHE STRING "HIP GPU architecture"
-        )
-    endif()
-    enable_language(HIP)
     if(NOT ANCORA_HIP_ARCHITECTURES)
+
         if(ANCORA_GPU_PLATFORM STREQUAL "nvidia")
             set(ANCORA_HIP_ARCHITECTURES "80")
         else()
             set(ANCORA_HIP_ARCHITECTURES "gfx90a")
         endif()
+
     endif()
 
-    set_target_properties(
-        ancora
-        PROPERTIES
-            HIP_ARCHITECTURES "${ANCORA_HIP_ARCHITECTURES}"
+
+    # ------------------------------------------------------------------------
+    # CMake's HIP architecture variable MUST be set before enable_language(HIP)
+    # ------------------------------------------------------------------------
+
+    set(
+        CMAKE_HIP_ARCHITECTURES
+        "${ANCORA_HIP_ARCHITECTURES}"
+        CACHE STRING
+        "HIP architecture(s)"
+        FORCE
     )
 
 
+    message(
+        STATUS
+        "ancora: HIP architecture = ${ANCORA_HIP_ARCHITECTURES}"
+    )
 
-    # -----------------------------------------------------------------------
-    # Explicit HIP platform macros.
+
+    # ------------------------------------------------------------------------
+    # CMake 3.28+ has CMAKE_HIP_PLATFORM.
     #
-    # This avoids relying solely on compiler/package autodetection.
-    # -----------------------------------------------------------------------
+    # Older versions, including CMake 3.22, don't have it; HIP_PLATFORM above
+    # is sufficient for the ROCm HIP package/compiler selection.
+    # ------------------------------------------------------------------------
+
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.28")
+
+        set(
+            CMAKE_HIP_PLATFORM
+            "${ANCORA_GPU_PLATFORM}"
+        )
+
+    endif()
+
+
+    # ------------------------------------------------------------------------
+    # Enable HIP
+    # ------------------------------------------------------------------------
+
+    enable_language(HIP)
+
+
+    # ------------------------------------------------------------------------
+    # Explicit HIP platform macro
+    # ------------------------------------------------------------------------
 
     if(ANCORA_GPU_PLATFORM STREQUAL "nvidia")
 
@@ -336,13 +351,12 @@ if(ANCORA_USE_GPU)
 
     endif()
 
-
 endif()
 
 
-# ===========================================================================
+# ============================================================================
 # Core library
-# ===========================================================================
+# ============================================================================
 
 add_library(
     ancora
@@ -380,9 +394,9 @@ add_library(
 )
 
 
-# ===========================================================================
+# ============================================================================
 # Include directories
-# ===========================================================================
+# ============================================================================
 
 target_include_directories(
     ancora
@@ -391,15 +405,11 @@ target_include_directories(
 )
 
 
-# ===========================================================================
-# Mode selection
-# ===========================================================================
+# ============================================================================
+# SAFE mode
+# ============================================================================
 
 if(ANCORA_MODE_SAFE)
-
-    # -----------------------------------------------------------------------
-    # SAFE
-    # -----------------------------------------------------------------------
 
     target_compile_definitions(
         ancora
@@ -425,11 +435,11 @@ if(ANCORA_MODE_SAFE)
     )
 
 
-else()
+# ============================================================================
+# FAST mode
+# ============================================================================
 
-    # -----------------------------------------------------------------------
-    # FAST
-    # -----------------------------------------------------------------------
+else()
 
     target_compile_definitions(
         ancora
@@ -438,48 +448,11 @@ else()
     )
 
 
+    # ========================================================================
+    # FAST + GPU
+    # ========================================================================
+
     if(ANCORA_USE_GPU)
-
-        # ===================================================================
-        # FAST + GPU
-        # ===================================================================
-
-        # ---------------------------------------------------------------
-        # Default architecture
-        # ---------------------------------------------------------------
-
-        if(NOT ANCORA_HIP_ARCHITECTURES)
-
-            if(ANCORA_GPU_PLATFORM STREQUAL "nvidia")
-
-                set(
-                    ANCORA_HIP_ARCHITECTURES
-                    "80"
-                )
-
-            else()
-
-                set(
-                    ANCORA_HIP_ARCHITECTURES
-                    "gfx90a"
-                )
-
-            endif()
-
-        endif()
-
-
-        message(
-            STATUS
-            "ancora: HIP architecture = ${ANCORA_HIP_ARCHITECTURES}"
-        )
-
-
-        # ---------------------------------------------------------------
-        # HIP GPU sources
-        #
-        # Each source is added exactly once.
-        # ---------------------------------------------------------------
 
         set(
             ANCORA_GPU_SOURCES
@@ -494,6 +467,7 @@ else()
         )
 
 
+        # CMake should treat these files as HIP sources.
         set_source_files_properties(
             ${ANCORA_GPU_SOURCES}
             PROPERTIES
@@ -519,14 +493,10 @@ else()
         )
 
 
-        # ---------------------------------------------------------------
-        # GPU dependencies
+        # hip::device provides the HIP device-side build/link support.
         #
-        # roc::hipblas itself depends on hip::host. Because find_package(hip)
-        # happened before find_package(hipblas), that dependency should now
-        # resolve correctly.
-        # ---------------------------------------------------------------
-
+        # roc::hipblas is the hipBLAS imported target. On NVIDIA this is the
+        # HIP-over-CUDA implementation.
         target_link_libraries(
             ancora
             PRIVATE
@@ -544,21 +514,18 @@ else()
 
         message(
             STATUS
-            "ancora: FAST mode with GPU enabled"
+            "ancora: FAST + GPU enabled"
         )
 
 
+    # ========================================================================
+    # FAST CPU
+    # ========================================================================
+
     else()
 
-        # ===================================================================
-        # FAST, CPU only
-        # ===================================================================
-
-        # ---------------------------------------------------------------
-        # BLAS
-        # ---------------------------------------------------------------
-
         find_package(BLAS REQUIRED)
+
 
         target_link_libraries(
             ancora
@@ -567,17 +534,26 @@ else()
         )
 
 
-        # ---------------------------------------------------------------
-        # Optional CBLAS domatcopy support
-        # ---------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Optional cblas_domatcopy
+        # --------------------------------------------------------------------
 
         include(CheckSymbolExists)
 
-        set(CMAKE_REQUIRED_LIBRARIES ${BLAS_LIBRARIES})
+        set(
+            CMAKE_REQUIRED_LIBRARIES
+            ${BLAS_LIBRARIES}
+        )
 
         if(BLAS_INCLUDE_DIRS)
-            set(CMAKE_REQUIRED_INCLUDES ${BLAS_INCLUDE_DIRS})
+
+            set(
+                CMAKE_REQUIRED_INCLUDES
+                ${BLAS_INCLUDE_DIRS}
+            )
+
         endif()
+
 
         check_symbol_exists(
             cblas_domatcopy
@@ -606,15 +582,15 @@ else()
 
         message(
             STATUS
-            "ancora: FAST mode enabled (CPU only)"
+            "ancora: FAST CPU mode enabled"
         )
 
     endif()
 
 
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------------
     # HiGHS
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------------
 
     target_link_libraries(
         ancora
@@ -625,9 +601,9 @@ else()
 endif()
 
 
-# ===========================================================================
+# ============================================================================
 # Installation
-# ===========================================================================
+# ============================================================================
 
 include(GNUInstallDirs)
 
@@ -647,9 +623,9 @@ install(
 )
 
 
-# ===========================================================================
+# ============================================================================
 # Tests
-# ===========================================================================
+# ============================================================================
 
 option(
     ANCORA_BUILD_TESTS
@@ -693,9 +669,9 @@ if(ANCORA_BUILD_TESTS)
 endif()
 
 
-# ===========================================================================
+# ============================================================================
 # Optional examples
-# ===========================================================================
+# ============================================================================
 
 # option(
 #     ANCORA_BUILD_EXAMPLES
@@ -719,9 +695,9 @@ endif()
 # endif()
 
 
-# ===========================================================================
+# ============================================================================
 # Optional Python bindings
-# ===========================================================================
+# ============================================================================
 
 # option(
 #     ANCORA_BUILD_PYTHON
