@@ -290,7 +290,30 @@ if(ANCORA_USE_GPU)
     # the underlying compiler (normally ROCm's clang).
     # -----------------------------------------------------------------------
 
+    set(CMAKE_HIP_PLATFORM "${ANCORA_GPU_PLATFORM}")
+
+    if(ANCORA_HIP_ARCHITECTURES)
+        set(
+            CMAKE_HIP_ARCHITECTURES
+            "${ANCORA_HIP_ARCHITECTURES}"
+            CACHE STRING "HIP GPU architecture"
+        )
+    endif()
     enable_language(HIP)
+    if(NOT ANCORA_HIP_ARCHITECTURES)
+        if(ANCORA_GPU_PLATFORM STREQUAL "nvidia")
+            set(ANCORA_HIP_ARCHITECTURES "80")
+        else()
+            set(ANCORA_HIP_ARCHITECTURES "gfx90a")
+        endif()
+    endif()
+
+    set_target_properties(
+        ancora
+        PROPERTIES
+            HIP_ARCHITECTURES "${ANCORA_HIP_ARCHITECTURES}"
+    )
+
 
 
     # -----------------------------------------------------------------------
