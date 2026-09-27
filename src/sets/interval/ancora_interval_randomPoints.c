@@ -19,10 +19,6 @@
 
 #include "ancora/sets/interval/ancora_interval_randomPoints.h"
 
-#ifdef ANCORA_USE_GPU
-#include "ancora/sets/zonotope/ancora_zonotope_randomPoints_gpu.hip.h"
-#endif
-
 ancora_status ancora_interval_randomPoints_uniform(ancora_mat *P,
                                                    const ancora_interval *I,
                                                    slong N)
@@ -103,10 +99,11 @@ ancora_status ancora_interval_randomPoints_uniform(ancora_mat *P,
      * SAFE mode, direct in FAST mode) and fed to ancora_random_uniform, which
      * is the mode-independent uniform sampler used by the existing set
      * templates (e.g. ancora_interval_initRandom_uniform). */
+    double lo, hi, sample;
     for (slong j = 0; j < N; j++) {
         for (slong i = 0; i < n; i++) {
-            double lo, hi, sample;
 #if ANCORA_MODE == ANCORA_MODE_SAFE
+            // TODO: That's not quite ok, correct in the future
             lo = arb_get_d(arb_mat_entry(I->lowerBound.repr, i, 0));
             hi = arb_get_d(arb_mat_entry(I->upperBound.repr, i, 0));
 #elif ANCORA_MODE == ANCORA_MODE_FAST

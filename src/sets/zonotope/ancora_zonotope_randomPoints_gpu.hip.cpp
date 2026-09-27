@@ -27,7 +27,7 @@
  * [offset[b], offset[b]+m[b]) of every row. Xbig is (M x N) row-major,
  * pair b's cube samples occupy rows [offset[b], offset[b]+m[b]). c_flat
  * is (B x n) row-major. res_flat is (B x n x N) row-major output. */
-__global__ void ancora_zonotope_batched_randomPoints_kernel(
+__global__ void ancora_zonotope_batched_randomPoints_standard_kernel(
     const double *G_flat,
     const double *Xbig,
     const double *c_flat,
@@ -106,7 +106,7 @@ extern "C" int ancora_zonotope_batched_randomPoints_standard_gpu(
         long total = B * n * N;
         int threads = 256;
         int blocks = (int)((total + threads - 1) / threads);
-        hipLaunchKernelGGL(ancora_zonotope_batched_randomPoints_kernel,
+        hipLaunchKernelGGL(ancora_zonotope_batched_randomPoints_standard_kernel,
                            dim3(blocks), dim3(threads), 0, 0,
                            G_dev, Xbig_dev, c_dev, offset_dev, m_dev, res_dev, n, M, N, B);
     }

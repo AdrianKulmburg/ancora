@@ -105,7 +105,7 @@ extern "C" {
  * Author(s):     Adrian Kulmburg
  */
 
-#define ancora_vec_transpose(res, v) ancora_mat_transpose(res, v);
+#define ancora_vec_transpose(res, v) ancora_mat_transpose(res, v)
 /* Computes the transpose of a vector (res = a^T, res is now a matrix).
  * INPUT:
  *      res             : Result matrix, already initialized as

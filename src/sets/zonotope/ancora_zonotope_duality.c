@@ -21,6 +21,10 @@
 
 #include "ancora/sets/zonotope/ancora_zonotope_duality.h"
 
+#ifdef ANCORA_USE_GPU
+#include "ancora/sets/zonotope/ancora_zonotope_duality_gpu.hip.h"
+#endif
+
 ancora_status ancora_zonotope_supportFunction(
 #if ANCORA_MODE == ANCORA_MODE_SAFE
     arb_t res,

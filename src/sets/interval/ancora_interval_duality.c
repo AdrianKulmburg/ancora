@@ -91,10 +91,23 @@ ancora_status ancora_interval_supportFunction(
 
     // center = (lowerBound + upperBound) / 2
     ANCORA_TRY(ancora_vec_add(&center, &I->lowerBound, &I->upperBound));
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+    arb_t half;
+    arb_init(half);
+    arb_set_d(half, 0.5);
+    ANCORA_TRY(ancora_vec_scalarMul(&center, &center, half));
+#elif ANCORA_MODE == ANCORA_MODE_FAST
     ANCORA_TRY(ancora_vec_scalarMul(&center, &center, 0.5));
+#endif
+
     // radius = (upperBound - lowerBound) / 2
     ANCORA_TRY(ancora_vec_sub(&radius, &I->upperBound, &I->lowerBound));
+#if ANCORA_MODE == ANCORA_MODE_SAFE
+    ANCORA_TRY(ancora_vec_scalarMul(&radius, &radius, half));
+    arb_clear(half);
+#elif ANCORA_MODE == ANCORA_MODE_FAST
     ANCORA_TRY(ancora_vec_scalarMul(&radius, &radius, 0.5));
+#endif
 
     // weighted_j = radius_j * d_j (elementwise)
 #if ANCORA_MODE == ANCORA_MODE_SAFE

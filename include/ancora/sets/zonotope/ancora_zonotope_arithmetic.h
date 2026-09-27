@@ -115,7 +115,7 @@ ancora_status ancora_zonotope_batched_affine(
     const ancora_mat *A,
     const ancora_vec *c,
     const ancora_zonotope **Z_batch,
-    slong B)
+    slong B);
 /* Computes res_batch[b] = A*Z_batch[b] + c for every b in [0, B). A (n x m)
  * and c (length n) are SHARED across the whole batch; only the zonotopes
  * differ. All Z_batch[b] must have dimension m (but may each have a

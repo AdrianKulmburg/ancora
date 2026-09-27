@@ -21,7 +21,7 @@
 #include "ancora/sets/zonotope/ancora_zonotope_randomPoints.h"
 
 #ifdef ANCORA_USE_GPU
-#include "ancora/sets/zonotope/ancora_zonotope_duality_gpu.hip.h"
+#include "ancora/sets/zonotope/ancora_zonotope_randomPoints_gpu.hip.h"
 #endif
 
 ancora_status ancora_zonotope_randomPoints_standard(ancora_mat *P,

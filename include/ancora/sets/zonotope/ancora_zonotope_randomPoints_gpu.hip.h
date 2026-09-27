@@ -29,14 +29,14 @@
 extern "C" {
 #endif
 
-int ancora_zonotope_batched_supportFunction_gpu(
-    const double *d_host,
+int ancora_zonotope_batched_randomPoints_standard_gpu(
     const double *G_host,
-    const slong *owner_host,
-    double *res_host, /* IN: dot(d_b,c_b) per b; OUT: full support values */
-    slong n_in,
-    slong P_in,
-    slong B_in);
+    const double *Xbig_host,
+    const double *c_host,
+    const slong *offset_host,
+    const slong *m_host,
+    double *res_host,
+    slong n_in, slong M_in, slong N_in, slong B_in);
 
 #ifdef __cplusplus
 }

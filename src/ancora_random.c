@@ -104,6 +104,8 @@ void ancora_random_ensureRandSeeded(void)
     }
 }
 
+// TODO: Implement a similar function that takes and outputs arb_t, and correct
+// ancora_interval_randomPoints for SAFE mode
 ancora_status ancora_random_uniform(double a, double b, double *res)
 /* Generates a double, uniformly distributed in [a, b].
  * INPUT:

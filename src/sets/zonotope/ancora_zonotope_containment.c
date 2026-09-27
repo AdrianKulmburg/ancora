@@ -32,11 +32,11 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "ancora/sets/zonotope/ancora_zonotope_containment.h"
+
 #if ANCORA_MODE == ANCORA_MODE_FAST
 #include <highs/interfaces/highs_c_api.h>
 #endif
-
-#include "ancora/sets/zonotope/ancora_zonotope_containment.h"
 
 ancora_status ancora_zonotope_containsPoint(const ancora_zonotope *Z,
                                        const ancora_vec *p,

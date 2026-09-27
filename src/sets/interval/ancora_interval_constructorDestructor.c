@@ -81,10 +81,10 @@ ancora_status ancora_interval_init(ancora_interval *I,
     for (slong i = 0; i < lowerBound->nrows; i++)
     {
 #if ANCORA_MODE == ANCORA_MODE_SAFE
-        if (arb_is_nan(arb_mat_entry(lowerBound->repr, i, 0))) {
+        if (arf_is_nan(arb_midref(arb_mat_entry(lowerBound->repr, i, 0)))) {
             ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Lower bound entry %ld is NaN; bounds must not be NaN (they may be +inf or -inf).", (long)i);
         }
-        if (arb_is_nan(arb_mat_entry(upperBound->repr, i, 0))) {
+        if (arf_is_nan(arb_midref(arb_mat_entry(upperBound->repr, i, 0)))) {
             ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Upper bound entry %ld is NaN; bounds must not be NaN (they may be +inf or -inf).", (long)i);
         }
 #elif ANCORA_MODE == ANCORA_MODE_FAST
