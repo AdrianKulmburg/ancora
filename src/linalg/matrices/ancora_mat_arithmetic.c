@@ -17,8 +17,11 @@
  * SPDX-License-Identifier: MIT
  */
 
-#if ANCORA_MODE == ANCORA_MODE_FAST && !defined(ANCORA_USE_GPU)
+#if ANCORA_MODE == ANCORA_MODE_FAST
 #include <limits.h>
+#endif
+
+#if ANCORA_MODE == ANCORA_MODE_FAST && !defined(ANCORA_USE_GPU)
 #include <cblas.h>
 #endif
 
