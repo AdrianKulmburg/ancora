@@ -26,6 +26,11 @@
  */
 
 #include <hip/hip_runtime.h>
+#if defined(__HIP_PLATFORM_NVIDIA__)
+#include <cublas_v2.h>
+#else
+#include <hipblas/hipblas.h>
+#endif
 
 #include "ancora/linalg/matrices/ancora_mat_arithmetic_gpu.hip.h"
 
@@ -205,24 +210,6 @@ fail:
  * b is (k x m) row-major, out is (n x m) row-major. res must not alias a
  * or b (same restriction as ancora_mat_mul itself).
  */
-__global__ void ancora_mat_mul_kernel(const double *a,
-                                      const double *b,
-                                      double *res,
-                                      long n,
-                                      long k,
-                                      long m)
-{
-    long row = (long)blockIdx.y * blockDim.y + threadIdx.y;
-    long col = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < n && col < m) {
-        double sum = 0.0;
-        for (long p = 0; p < k; p++) {
-            sum += a[row * k + p] * b[p * m + col];
-        }
-        res[row * m + col] = sum;
-    }
-}
-
 extern "C" int ancora_mat_mul_gpu(const double *a_host,
                                   const double *b_host,
                                   double *res_host,
@@ -250,14 +237,49 @@ extern "C" int ancora_mat_mul_gpu(const double *a_host,
     if (err != hipSuccess) goto fail;
 
     {
-        dim3 threads(16, 16);
-        dim3 blocks((unsigned int)((m + threads.x - 1) / threads.x),
-                    (unsigned int)((n + threads.y - 1) / threads.y));
-        hipLaunchKernelGGL(ancora_mat_mul_kernel, blocks, threads, 0, 0,
-                           a_dev, b_dev, res_dev, n, k, m);
+        const double alpha = 1.0, beta = 0.0;
+        /* Row-major C = A*B via the standard BLAS row/column-major trick:
+         * both cuBLAS and hipBLAS are column-major, so the same memory
+         * reinterpreted as column-major gives C^T = B^T * A^T - swapping
+         * operand order/dimensions produces the correct row-major result
+         * with no actual data rearrangement. */
+#if defined(__HIP_PLATFORM_NVIDIA__)
+        /* ROCm's apt-packaged hipblas is AMD-backend-only (its CMake
+         * config references a hip::host target that does not exist on
+         * the NVIDIA/HIP-over-CUDA platform); rather than building
+         * hipBLAS from source with -DUSE_CUDA=ON, call cuBLAS directly
+         * here, since HIP-over-CUDA is already running on the CUDA stack
+         * underneath. */
+        cublasHandle_t handle = NULL;
+        cublasStatus_t stat = cublasCreate(&handle);
+        if (stat != CUBLAS_STATUS_SUCCESS) goto fail;
+
+        stat = cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                           (int)m, (int)n, (int)k,
+                           &alpha,
+                           b_dev, (int)m,
+                           a_dev, (int)k,
+                           &beta,
+                           res_dev, (int)m);
+        cublasDestroy(handle);
+        if (stat != CUBLAS_STATUS_SUCCESS) goto fail;
+#else
+        hipblasHandle_t handle = NULL;
+        hipblasStatus_t stat = hipblasCreate(&handle);
+        if (stat != HIPBLAS_STATUS_SUCCESS) goto fail;
+
+        stat = hipblasDgemm(handle, HIPBLAS_OP_N, HIPBLAS_OP_N,
+                            (int)m, (int)n, (int)k,
+                            &alpha,
+                            b_dev, (int)m,
+                            a_dev, (int)k,
+                            &beta,
+                            res_dev, (int)m);
+        hipblasDestroy(handle);
+        if (stat != HIPBLAS_STATUS_SUCCESS) goto fail;
+#endif
     }
-    err = hipGetLastError();
-    if (err != hipSuccess) goto fail;
+
     err = hipDeviceSynchronize();
     if (err != hipSuccess) goto fail;
 

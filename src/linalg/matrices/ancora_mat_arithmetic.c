@@ -17,6 +17,11 @@
  * SPDX-License-Identifier: MIT
  */
 
+#if ANCORA_MODE == ANCORA_MODE_FAST && !defined(ANCORA_USE_GPU)
+#include <limits.h>
+#include <cblas.h>
+#endif
+
 #include "ancora/linalg/matrices/ancora_mat_arithmetic.h"
 
 ancora_status ancora_mat_add(ancora_mat *res,
@@ -259,19 +264,26 @@ ancora_status ancora_mat_mul(ancora_mat *res,
     slong k = a->ncols;
     slong m = b->ncols;
     #ifdef ANCORA_USE_GPU
+        if (n > INT_MAX || k > INT_MAX || m > INT_MAX) {
+            ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Matrix dimensions exceed BLAS's 32-bit integer limit.");
+        }
+
         if (ancora_mat_mul_gpu(a->repr, b->repr, res->repr, n, k, m) != 0) {
             ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "GPU launch failed.");
         }
     #else
-        for (slong i = 0; i < n; i++) {
-            for (slong j = 0; j < m; j++) {
-                double sum = 0.0;
-                for (slong p = 0; p < k; p++) {
-                    sum += a->repr[i * k + p] * b->repr[p * m + j];
-                }
-                res->repr[i * m + j] = sum;
-            }
+
+        if (n > INT_MAX || k > INT_MAX || m > INT_MAX) {
+            ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Matrix dimensions exceed BLAS's 32-bit integer limit.");
         }
+        /* res = 1.0 * a * b + 0.0 * res, all row-major, no transposes.
+         * Leading dimensions equal the row length of each matrix (k for
+         * a, m for b and res), since there is no padding between rows. */
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    (int)n, (int)m, (int)k,
+                    1.0, a->repr, (int)k,
+                    b->repr, (int)m,
+                    0.0, res->repr, (int)m);
     #endif
 #endif
     return ANCORA_OK;
@@ -326,6 +338,16 @@ ancora_status ancora_mat_transpose(ancora_mat *res, const ancora_mat *a)
         if (ancora_mat_transpose_gpu(a->repr, res->repr, a->nrows, a->ncols) != 0) {
             ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "GPU launch failed.");
         }
+    #elif defined(ANCORA_HAVE_CBLAS_DOMATCOPY)
+        /* cblas_domatcopy is a widely-shipped BLAS extension (OpenBLAS,
+         * some other vendors), NOT part of the official BLAS standard, so
+         * it isn't guaranteed to exist on every BLAS -- gated behind
+         * ANCORA_HAVE_CBLAS_DOMATCOPY (see CMakeLists.txt), falling back
+         * to the plain loop below when unavailable (e.g. reference BLAS). */
+        cblas_domatcopy(CblasRowMajor, CblasTrans,
+                        (size_t)a->nrows, (size_t)a->ncols,
+                        1.0, a->repr, (size_t)a->ncols,
+                        res->repr, (size_t)a->nrows);
     #else
         for (slong i = 0; i < a->nrows; i++) {
             for (slong j = 0; j < a->ncols; j++) {
