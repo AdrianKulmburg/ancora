@@ -132,7 +132,7 @@ ancora_status ancora_interval_randomPoints_uniform(ancora_mat *P,
              * validation ancora_random_uniform would repeat every call
              * (NULL check, a>b check) has already been done once per row
              * above - redoing it N times per row was pure waste. */
-            P->repr[i * N + j] = lo + xorshiftUnit_public() * range;
+            P->repr[i * N + j] = lo + xorshiftUnit() * range;
         }
     }
 #endif

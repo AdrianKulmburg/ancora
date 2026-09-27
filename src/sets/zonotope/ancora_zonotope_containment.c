@@ -204,6 +204,18 @@ ancora_status ancora_zonotope_containsPoints(const ancora_zonotope *Z,
     // Disable console logging
     Highs_setBoolOptionValue(highs, "log_to_console", false);
 
+    // This LP is re-solved many times with only the right-hand side changing
+    // (Highs_changeRowsBoundsBySet); presolve re-analyzes the whole problem
+    // on every Highs_run call regardless, which for a problem this small
+    // and cheap can dominate over the actual solve - disable it so re-solves
+    // go straight to the solver. Simplex (not the default auto-chosen method,
+    // which may select IPM) is forced because only simplex can warm-start
+    // from the previous optimal basis after a bound change; IPM effectively
+    // restarts from scratch on every re-solve, defeating the whole point of
+    // reusing one HiGHS instance across points.
+    Highs_setStringOptionValue(highs, "presolve", "off");
+    Highs_setStringOptionValue(highs, "solver", "simplex");
+
     HighsInt pass_status = Highs_passLp(highs, numcol, numrow, numnz,
                                         kHighsMatrixFormatColwise,
                                         kHighsObjSenseMinimize, 0.0,
@@ -456,6 +468,18 @@ ancora_status ancora_zonotope_batched_containsPoints(
 
         // Disable console logging
         Highs_setBoolOptionValue(highs, "log_to_console", false);
+
+        // This LP is re-solved many times with only the right-hand side changing
+        // (Highs_changeRowsBoundsBySet); presolve re-analyzes the whole problem
+        // on every Highs_run call regardless, which for a problem this small
+        // and cheap can dominate over the actual solve -- disable it so re-solves
+        // go straight to the solver. Simplex (not the default auto-chosen method,
+        // which may select IPM) is forced because only simplex can warm-start
+        // from the previous optimal basis after a bound change; IPM effectively
+        // restarts from scratch on every re-solve, defeating the whole point of
+        // reusing one HiGHS instance across points.
+        Highs_setStringOptionValue(highs, "presolve", "off");
+        Highs_setStringOptionValue(highs, "solver", "simplex");
 
         HighsInt pass_status = Highs_passLp(highs, numcol, numrow, numnz,
                                             kHighsMatrixFormatColwise,
