@@ -36,6 +36,13 @@ ancora_status ancora_zonotope_supportFunction(
 /* Computes the support function of the zonotope Z in the direction d, i.e.
  * h_Z(d) = sup { d^T x | x in Z }.
  *
+ * This no longer transposes w (the 1 x p row d^T*G) back into a p x 1
+ * column before computing its 1-norm: ancora_vec_1norm requires a column,
+ * but a 1-norm is just the sum of absolute values, which does not care
+ * about row-vs-column layout. Summing |w[0][j]| directly removes an
+ * entire allocation (the old wCol) and an entire O(p) transpose call that
+ * existed solely to satisfy ancora_vec_1norm's column-only interface.
+ *
  * INPUT:
  *      res             : Output scalar (arb_t in SAFE mode, double* in FAST
  *                        mode), set to the support value
@@ -47,14 +54,14 @@ ancora_status ancora_zonotope_supportFunction(
  *
  * RUNTIME:
  *      O(n*p*ANCORA_DEFAULT_PREC)
- *      where n is the dimension of the zonotope and p its number of generators.
+ *      where n is the dimension of the zonotope and p its number of
+ *      generators.
  *
  * Created:       2026-09-25
- * Last modified: 2026-09-25
+ * Last modified: 2026-09-27
  * Author(s):     Adrian Kulmburg
  */
 {
-    // Check that res, Z, and d are well-defined
     if (res == NULL) {
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer res is NULL; it should point to a valid output scalar.");
     }
@@ -65,12 +72,10 @@ ancora_status ancora_zonotope_supportFunction(
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Pointer d is NULL; it should point to a valid ancora_vec instance.");
     }
 
-    // Verify that d is a vector
     if (d->ncols != 1) {
         ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Direction d is not a vector; it should be a column vector.");
     }
 
-    // Dimension check
     if (d->nrows != Z->c.nrows) {
         ANCORA_ERROR(ANCORA_ERROR_DIM_MISMATCH,
                       "Zonotope Z has dimension %ld, direction d has length %ld; they need to be the same.",
@@ -82,42 +87,116 @@ ancora_status ancora_zonotope_supportFunction(
 
     /* h_Z(d) = d^T c + ||d^T G||_1. Transpose d (O(n)) rather than G
      * (O(n*p)), then a single (1 x n)*(n x p) product gives all p column
-     * dot-products at once via ancora_mat_mul's own access pattern.
-     * ancora_vec_1norm only accepts an (n x 1) column, so the (1 x p)
-     * product is transposed back into a (p x 1) column afterward - this
-     * transpose is O(p) (it only has p entries), not O(n*p), so it does
-     * not undo the saving from avoiding a transpose of G itself. */
-    ancora_mat dT;
+     * dot-products at once. */
+    ancora_mat dT, w;
     ANCORA_TRY(ancora_mat_init(&dT, 1, n));
     ANCORA_TRY(ancora_vec_transpose(&dT, d));
-
-    ancora_mat w, wCol;
     ANCORA_TRY(ancora_mat_init(&w, 1, p));
     ANCORA_TRY(ancora_mat_mul(&w, &dT, &Z->G));
-    ANCORA_TRY(ancora_mat_init(&wCol, p, 1));
-    ANCORA_TRY(ancora_mat_transpose(&wCol, &w));
 
 #if ANCORA_MODE == ANCORA_MODE_SAFE
-    arb_t dotVal, normVal;
+    arb_t dotVal, normVal, term;
     arb_init(dotVal);
     arb_init(normVal);
+    arb_init(term);
     ANCORA_TRY(ancora_vec_dot(dotVal, d, &Z->c));
-    ANCORA_TRY(ancora_vec_1norm(normVal, &wCol));
+    arb_zero(normVal);
+    for (slong j = 0; j < p; j++) {
+        arb_abs(term, arb_mat_entry(w.repr, 0, j));
+        arb_add(normVal, normVal, term, ANCORA_DEFAULT_PREC);
+    }
     arb_add(res, dotVal, normVal, ANCORA_DEFAULT_PREC);
     arb_clear(dotVal);
     arb_clear(normVal);
+    arb_clear(term);
 #elif ANCORA_MODE == ANCORA_MODE_FAST
-    double dotVal, normVal;
+    double dotVal, normVal = 0.0;
     ANCORA_TRY(ancora_vec_dot(&dotVal, d, &Z->c));
-    ANCORA_TRY(ancora_vec_1norm(&normVal, &wCol));
+    for (slong j = 0; j < p; j++) {
+        normVal += fabs(w.repr[j]);
+    }
     *res = dotVal + normVal;
 #endif
 
     ANCORA_TRY(ancora_mat_free(&dT));
     ANCORA_TRY(ancora_mat_free(&w));
-    ANCORA_TRY(ancora_mat_free(&wCol));
     return ANCORA_OK;
 }
+
+/* Below this n*P product, the CPU loop runs even when ANCORA_USE_GPU is
+ * defined -- placeholder, tune against real hardware. */
+#define ANCORA_SF_GPU_MIN_ELEMENTS 100000
+
+#ifdef ANCORA_USE_GPU
+/* Persistent host-side packing buffers for the GPU path: grow-only,
+ * reused across calls, never freed until process exit -- avoids a fresh
+ * malloc/free of d_flat/G_flat/owner on every call. NOT thread-safe
+ * (module-level static state); fine for a single-threaded caller. */
+static double *g_zsf_d_flat = NULL, *g_zsf_G_flat = NULL;
+static slong *g_zsf_owner = NULL;
+static size_t g_zsf_d_capacity = 0, g_zsf_G_capacity = 0, g_zsf_owner_capacity = 0;
+
+static int ancora_zsf_buf_ensure(size_t d_bytes, size_t G_bytes, size_t owner_bytes)
+{
+    if (g_zsf_d_capacity < d_bytes) {
+        free(g_zsf_d_flat);
+        g_zsf_d_flat = (double *)malloc(d_bytes);
+        if (g_zsf_d_flat == NULL) { g_zsf_d_capacity = 0; return -1; }
+        g_zsf_d_capacity = d_bytes;
+    }
+    if (g_zsf_G_capacity < G_bytes) {
+        free(g_zsf_G_flat);
+        g_zsf_G_flat = (double *)malloc(G_bytes);
+        if (g_zsf_G_flat == NULL) { g_zsf_G_capacity = 0; return -1; }
+        g_zsf_G_capacity = G_bytes;
+    }
+    if (g_zsf_owner_capacity < owner_bytes) {
+        free(g_zsf_owner);
+        g_zsf_owner = (slong *)malloc(owner_bytes);
+        if (g_zsf_owner == NULL) { g_zsf_owner_capacity = 0; return -1; }
+        g_zsf_owner_capacity = owner_bytes;
+    }
+    return 0;
+}
+#endif
+
+#if ANCORA_MODE == ANCORA_MODE_FAST
+/* Shared fused-CPU implementation (no wCol/transpose, direct row-norm
+ * summation), used both when ANCORA_USE_GPU is not defined, and as the
+ * fallback below ANCORA_SF_GPU_MIN_ELEMENTS when it is. */
+static ancora_status ancora_zonotope_batched_supportFunction_cpu(
+    double *res, const ancora_zonotope **Z_batch, const ancora_vec **d_batch,
+    const slong *p, slong n, slong B)
+{
+    ancora_status status = ANCORA_OK;
+    ancora_mat dT;
+    ANCORA_TRY(ancora_mat_init(&dT, 1, n));
+
+    for (slong b = 0; b < B; b++) {
+        status = ancora_vec_transpose(&dT, d_batch[b]);
+        if (status != ANCORA_OK) goto cleanup;
+
+        ancora_mat w;
+        status = ancora_mat_init(&w, 1, p[b]);
+        if (status != ANCORA_OK) goto cleanup;
+        status = ancora_mat_mul(&w, &dT, &Z_batch[b]->G);
+        if (status != ANCORA_OK) { ancora_mat_free(&w); goto cleanup; }
+
+        double dotVal, normVal = 0.0;
+        status = ancora_vec_dot(&dotVal, d_batch[b], &Z_batch[b]->c);
+        for (slong j = 0; status == ANCORA_OK && j < p[b]; j++) {
+            normVal += fabs(w.repr[j]);
+        }
+        if (status == ANCORA_OK) res[b] = dotVal + normVal;
+        ancora_mat_free(&w);
+        if (status != ANCORA_OK) goto cleanup;
+    }
+
+cleanup:
+    ancora_mat_free(&dT);
+    return status;
+}
+#endif
 
 ancora_status ancora_zonotope_batched_supportFunction(
 #if ANCORA_MODE == ANCORA_MODE_SAFE
@@ -131,6 +210,16 @@ ancora_status ancora_zonotope_batched_supportFunction(
 /* Computes res[b] = h_{Z_batch[b]}(d_batch[b]) for every b in [0, B). All
  * zonotopes and directions share dimension n, but each Z_batch[b] may have
  * its OWN generator count p_b.
+ *
+ * Like ancora_zonotope_supportFunction, this no longer transposes each
+ * pair's w (1 x p_b row) back into a p_b x 1 column before summing its
+ * 1-norm -- the row is summed directly, removing an allocation and an
+ * O(p_b) transpose call per pair. The FAST-mode GPU path also uses
+ * persistent, grow-only host packing buffers (see ancora_zsf_buf_ensure)
+ * instead of a fresh malloc/free every call, and only dispatches to the
+ * GPU when n*P >= ANCORA_SF_GPU_MIN_ELEMENTS (the kernel is P-way
+ * parallel with O(n) work per thread; below that, transfer/launch
+ * overhead can exceed the reduction's own cost).
  *
  * INPUT:
  *      res             : Output array (arb_ptr in SAFE mode, double* in
@@ -146,12 +235,10 @@ ancora_status ancora_zonotope_batched_supportFunction(
  *      ancora_status   : Status (i.e., whether errors arose)
  *
  * RUNTIME:
- *      O(n*P*ANCORA_DEFAULT_PREC) where P = sum_b p_b - identical total
- *      work to B separate ancora_zonotope_supportFunction calls (a
- *      reduction; no less work is possible). The CPU path's improvement
- *      is one validation pass and B-1 fewer dT allocations; the GPU
- *      path's improvement is one kernel launch (P-way parallel) instead
- *      of B separate ones.
+ *      O(n*P*ANCORA_DEFAULT_PREC) where P = sum_b p_b (a reduction; no
+ *      less work is possible). With ANCORA_USE_GPU and n*P >=
+ *      ANCORA_SF_GPU_MIN_ELEMENTS, an O(n*P) host-side packing pass
+ *      precedes the GPU dispatch, using persistent buffers.
  *
  * Created:       2026-09-27
  * Last modified: 2026-09-27
@@ -219,8 +306,6 @@ ancora_status ancora_zonotope_batched_supportFunction(
     }
 
 #if ANCORA_MODE == ANCORA_MODE_SAFE
-    // No dedicated ARB GPU path exists (nor should one - see project
-    // convention on FLINT/GPU). Loop, reusing dT across iterations.
     ancora_mat dT;
     ANCORA_TRY(ancora_mat_init(&dT, 1, n));
 
@@ -228,26 +313,29 @@ ancora_status ancora_zonotope_batched_supportFunction(
         status = ancora_vec_transpose(&dT, d_batch[b]);
         if (status != ANCORA_OK) goto cleanup_safe;
 
-        ancora_mat w, wCol;
+        ancora_mat w;
         status = ancora_mat_init(&w, 1, p[b]);
         if (status != ANCORA_OK) goto cleanup_safe;
         status = ancora_mat_mul(&w, &dT, &Z_batch[b]->G);
         if (status != ANCORA_OK) { ancora_mat_free(&w); goto cleanup_safe; }
-        status = ancora_mat_init(&wCol, p[b], 1);
-        if (status != ANCORA_OK) { ancora_mat_free(&w); goto cleanup_safe; }
-        status = ancora_mat_transpose(&wCol, &w);
-        if (status != ANCORA_OK) { ancora_mat_free(&w); ancora_mat_free(&wCol); goto cleanup_safe; }
 
-        arb_t dotVal, normVal;
+        arb_t dotVal, normVal, term;
         arb_init(dotVal);
         arb_init(normVal);
+        arb_init(term);
         status = ancora_vec_dot(dotVal, d_batch[b], &Z_batch[b]->c);
-        if (status == ANCORA_OK) status = ancora_vec_1norm(normVal, &wCol);
-        if (status == ANCORA_OK) arb_add(res + b, dotVal, normVal, ANCORA_DEFAULT_PREC);
+        if (status == ANCORA_OK) {
+            arb_zero(normVal);
+            for (slong j = 0; j < p[b]; j++) {
+                arb_abs(term, arb_mat_entry(w.repr, 0, j));
+                arb_add(normVal, normVal, term, ANCORA_DEFAULT_PREC);
+            }
+            arb_add(res + b, dotVal, normVal, ANCORA_DEFAULT_PREC);
+        }
         arb_clear(dotVal);
         arb_clear(normVal);
+        arb_clear(term);
         ancora_mat_free(&w);
-        ancora_mat_free(&wCol);
         if (status != ANCORA_OK) goto cleanup_safe;
     }
 
@@ -261,81 +349,55 @@ cleanup_safe:
     return ANCORA_OK;
 #elif ANCORA_MODE == ANCORA_MODE_FAST
     #ifdef ANCORA_USE_GPU
-        // Compute the dot(d_b, c_b) term on the host first (O(n*B),
-        // negligible next to the O(n*P) generator work) and use it as the
-        // GPU accumulator's initial value.
-        for (slong b = 0; b < B; b++) {
-            double dotAcc = 0.0;
-            for (slong i = 0; i < n; i++) {
-                dotAcc += d_batch[b]->repr[i] * Z_batch[b]->c.repr[i];
+        size_t total = (size_t)(n * P);
+        if (total >= ANCORA_SF_GPU_MIN_ELEMENTS) {
+            for (slong b = 0; b < B; b++) {
+                double dotAcc = 0.0;
+                for (slong i = 0; i < n; i++) {
+                    dotAcc += d_batch[b]->repr[i] * Z_batch[b]->c.repr[i];
+                }
+                res[b] = dotAcc;
             }
-            res[b] = dotAcc;
-        }
 
-        // Pack d and G into flat buffers, plus an owner[] array mapping
-        // each of the P global generator columns back to its batch index,
-        // since the kernel is one-thread-per-column.
-        double *d_flat = (double *)malloc((size_t)(B * n) * sizeof(double));
-        double *G_flat = (double *)malloc((size_t)(n * P) * sizeof(double));
-        slong *owner = (slong *)malloc((size_t)P * sizeof(slong));
-        if (d_flat == NULL || G_flat == NULL || owner == NULL) {
-            free(d_flat); free(G_flat); free(owner); free(p); free(offset);
-            ANCORA_ERROR(ANCORA_ERROR_ALLOC, "ancora_zonotope_batched_supportFunction: failed to allocate GPU packing buffers.");
-        }
-        // (G_flat packing done properly below, per-row, since each pair's
-        // G_b is (n x p_b) and columns must land at the right global
-        // offset within each row of the (n x P) conceptual layout.)
-        for (slong b = 0; b < B; b++) {
-            for (slong i = 0; i < n; i++) {
-                memcpy(&G_flat[i * P + offset[b]], &Z_batch[b]->G.repr[i * p[b]], (size_t)p[b] * sizeof(double));
+            size_t d_bytes = (size_t)(B * n) * sizeof(double);
+            size_t G_bytes = (size_t)(n * P) * sizeof(double);
+            size_t owner_bytes = (size_t)P * sizeof(slong);
+            if (ancora_zsf_buf_ensure(d_bytes, G_bytes, owner_bytes) != 0) {
+                free(p); free(offset);
+                ANCORA_ERROR(ANCORA_ERROR_ALLOC, "ancora_zonotope_batched_supportFunction: failed to allocate GPU packing buffers.");
             }
-            for (slong j = 0; j < p[b]; j++) {
-                owner[offset[b] + j] = b;
+
+            for (slong b = 0; b < B; b++) {
+                memcpy(&g_zsf_d_flat[b * n], d_batch[b]->repr, (size_t)n * sizeof(double));
+                for (slong i = 0; i < n; i++) {
+                    memcpy(&g_zsf_G_flat[i * P + offset[b]], &Z_batch[b]->G.repr[i * p[b]], (size_t)p[b] * sizeof(double));
+                }
+                for (slong j = 0; j < p[b]; j++) {
+                    g_zsf_owner[offset[b] + j] = b;
+                }
             }
+
+            int gpu_status = ancora_zonotope_batched_supportFunction_gpu(
+                g_zsf_d_flat, g_zsf_G_flat, g_zsf_owner, res, n, P, B);
+
+            free(p);
+            free(offset);
+
+            if (gpu_status != 0) {
+                ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "ancora_zonotope_batched_supportFunction: GPU kernel launch failed.");
+            }
+            return ANCORA_OK;
+        } else {
+            status = ancora_zonotope_batched_supportFunction_cpu(res, Z_batch, d_batch, p, n, B);
+            free(p);
+            free(offset);
+            if (status != ANCORA_OK) {
+                ANCORA_ERROR(status, "ancora_zonotope_batched_supportFunction: per-pair support function computation failed (see above).");
+            }
+            return ANCORA_OK;
         }
-
-        int gpu_status = ancora_zonotope_batched_supportFunction_gpu(
-            d_flat, G_flat, owner, res, n, P, B);
-
-        free(d_flat);
-        free(G_flat);
-        free(owner);
-        free(p);
-        free(offset);
-
-        if (gpu_status != 0) {
-            ANCORA_ERROR(ANCORA_ERROR_GPU_LAUNCH, "ancora_zonotope_batched_supportFunction: GPU kernel launch failed.");
-        }
-        return ANCORA_OK;
     #else
-        ancora_mat dT;
-        ANCORA_TRY(ancora_mat_init(&dT, 1, n));
-
-        for (slong b = 0; b < B; b++) {
-            status = ancora_vec_transpose(&dT, d_batch[b]);
-            if (status != ANCORA_OK) goto cleanup_fast;
-
-            ancora_mat w, wCol;
-            status = ancora_mat_init(&w, 1, p[b]);
-            if (status != ANCORA_OK) goto cleanup_fast;
-            status = ancora_mat_mul(&w, &dT, &Z_batch[b]->G);
-            if (status != ANCORA_OK) { ancora_mat_free(&w); goto cleanup_fast; }
-            status = ancora_mat_init(&wCol, p[b], 1);
-            if (status != ANCORA_OK) { ancora_mat_free(&w); goto cleanup_fast; }
-            status = ancora_mat_transpose(&wCol, &w);
-            if (status != ANCORA_OK) { ancora_mat_free(&w); ancora_mat_free(&wCol); goto cleanup_fast; }
-
-            double dotVal, normVal;
-            status = ancora_vec_dot(&dotVal, d_batch[b], &Z_batch[b]->c);
-            if (status == ANCORA_OK) status = ancora_vec_1norm(&normVal, &wCol);
-            if (status == ANCORA_OK) res[b] = dotVal + normVal;
-            ancora_mat_free(&w);
-            ancora_mat_free(&wCol);
-            if (status != ANCORA_OK) goto cleanup_fast;
-        }
-
-    cleanup_fast:
-        ancora_mat_free(&dT);
+        status = ancora_zonotope_batched_supportFunction_cpu(res, Z_batch, d_batch, p, n, B);
         free(p);
         free(offset);
         if (status != ANCORA_OK) {

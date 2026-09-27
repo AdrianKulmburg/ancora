@@ -6,6 +6,13 @@
  * GPU backend for ancora_zonotope_randomPoints when compiled in
  * ANCORA_MODE_FAST with ANCORA_USE_GPU enabled.
  *
+ * PERSISTENT STATE: the device buffers below are kept alive across calls
+ * instead of a fresh hipMalloc/hipFree every time -- same rationale and
+ * pattern as ancora_mat_gpu.hip.cpp's device buffer cache. Buffers only
+ * GROW (never shrink) and are never freed until process exit. NOT
+ * thread-safe (module-level static state, no locking); fine for a
+ * single-threaded caller such as the benchmark driver.
+ *
  * File Information
  * ----------------
  * Created:       2026-09-27
@@ -21,6 +28,37 @@
 #include <hip/hip_runtime.h>
 
 #include "ancora/sets/zonotope/ancora_zonotope_randomPoints_gpu.hip.h"
+
+/* ------------------------------------------------------------------ */
+/* Persistent device buffer cache (see ancora_mat_gpu.hip.cpp for the   */
+/* same pattern, documented in more detail there)                      */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    void *ptr;
+    size_t capacity_bytes;
+} ancora_zrp_gpu_buf;
+
+static int ancora_zrp_gpu_buf_ensure(ancora_zrp_gpu_buf *buf, size_t needed_bytes)
+{
+    if (buf->capacity_bytes >= needed_bytes) {
+        return 0;
+    }
+    if (buf->ptr) {
+        (void)hipFree(buf->ptr);
+        buf->ptr = NULL;
+        buf->capacity_bytes = 0;
+    }
+    hipError_t err = hipMalloc(&buf->ptr, needed_bytes);
+    if (err != hipSuccess) {
+        return -1;
+    }
+    buf->capacity_bytes = needed_bytes;
+    return 0;
+}
+
+static ancora_zrp_gpu_buf g_G = {0}, g_Xbig = {0}, g_c = {0};
+static ancora_zrp_gpu_buf g_offset = {0}, g_m = {0}, g_res = {0};
 
 /* One thread per (pair, output row, output col) triple  B*n*N threads
  * total. G_flat is (n x M) row-major, pair b's generators occupy columns
@@ -68,8 +106,6 @@ extern "C" int ancora_zonotope_batched_randomPoints_standard_gpu(
     slong n_in, slong M_in, slong N_in, slong B_in)
 {
     long n = (long)n_in, M = (long)M_in, N = (long)N_in, B = (long)B_in;
-    double *G_dev = NULL, *Xbig_dev = NULL, *c_dev = NULL, *res_dev = NULL;
-    long *offset_dev = NULL, *m_dev = NULL;
     hipError_t err;
 
     size_t G_bytes = (size_t)(n * M) * sizeof(double);
@@ -78,29 +114,30 @@ extern "C" int ancora_zonotope_batched_randomPoints_standard_gpu(
     size_t res_bytes = (size_t)(B * n * N) * sizeof(double);
     size_t idx_bytes = (size_t)B * sizeof(long);
 
-    err = hipMalloc((void **)&G_dev, G_bytes);
-    if (err != hipSuccess) goto fail;
-    err = hipMalloc((void **)&Xbig_dev, Xbig_bytes);
-    if (err != hipSuccess) goto fail;
-    err = hipMalloc((void **)&c_dev, c_bytes);
-    if (err != hipSuccess) goto fail;
-    err = hipMalloc((void **)&offset_dev, idx_bytes);
-    if (err != hipSuccess) goto fail;
-    err = hipMalloc((void **)&m_dev, idx_bytes);
-    if (err != hipSuccess) goto fail;
-    err = hipMalloc((void **)&res_dev, res_bytes);
-    if (err != hipSuccess) goto fail;
+    if (ancora_zrp_gpu_buf_ensure(&g_G, G_bytes) != 0) return -1;
+    if (ancora_zrp_gpu_buf_ensure(&g_Xbig, Xbig_bytes) != 0) return -1;
+    if (ancora_zrp_gpu_buf_ensure(&g_c, c_bytes) != 0) return -1;
+    if (ancora_zrp_gpu_buf_ensure(&g_offset, idx_bytes) != 0) return -1;
+    if (ancora_zrp_gpu_buf_ensure(&g_m, idx_bytes) != 0) return -1;
+    if (ancora_zrp_gpu_buf_ensure(&g_res, res_bytes) != 0) return -1;
+
+    double *G_dev = (double *)g_G.ptr;
+    double *Xbig_dev = (double *)g_Xbig.ptr;
+    double *c_dev = (double *)g_c.ptr;
+    long *offset_dev = (long *)g_offset.ptr;
+    long *m_dev = (long *)g_m.ptr;
+    double *res_dev = (double *)g_res.ptr;
 
     err = hipMemcpy(G_dev, G_host, G_bytes, hipMemcpyHostToDevice);
-    if (err != hipSuccess) goto fail;
+    if (err != hipSuccess) return -1;
     err = hipMemcpy(Xbig_dev, Xbig_host, Xbig_bytes, hipMemcpyHostToDevice);
-    if (err != hipSuccess) goto fail;
+    if (err != hipSuccess) return -1;
     err = hipMemcpy(c_dev, c_host, c_bytes, hipMemcpyHostToDevice);
-    if (err != hipSuccess) goto fail;
+    if (err != hipSuccess) return -1;
     err = hipMemcpy(offset_dev, offset_host, idx_bytes, hipMemcpyHostToDevice);
-    if (err != hipSuccess) goto fail;
+    if (err != hipSuccess) return -1;
     err = hipMemcpy(m_dev, m_host, idx_bytes, hipMemcpyHostToDevice);
-    if (err != hipSuccess) goto fail;
+    if (err != hipSuccess) return -1;
 
     {
         long total = B * n * N;
@@ -111,23 +148,12 @@ extern "C" int ancora_zonotope_batched_randomPoints_standard_gpu(
                            G_dev, Xbig_dev, c_dev, offset_dev, m_dev, res_dev, n, M, N, B);
     }
     err = hipGetLastError();
-    if (err != hipSuccess) goto fail;
+    if (err != hipSuccess) return -1;
     err = hipDeviceSynchronize();
-    if (err != hipSuccess) goto fail;
+    if (err != hipSuccess) return -1;
 
     err = hipMemcpy(res_host, res_dev, res_bytes, hipMemcpyDeviceToHost);
-    if (err != hipSuccess) goto fail;
+    if (err != hipSuccess) return -1;
 
-    (void)hipFree(G_dev); (void)hipFree(Xbig_dev); (void)hipFree(c_dev);
-    (void)hipFree(offset_dev); (void)hipFree(m_dev); (void)hipFree(res_dev);
     return 0;
-
-fail:
-    if (G_dev) (void)hipFree(G_dev);
-    if (Xbig_dev) (void)hipFree(Xbig_dev);
-    if (c_dev) (void)hipFree(c_dev);
-    if (offset_dev) (void)hipFree(offset_dev);
-    if (m_dev) (void)hipFree(m_dev);
-    if (res_dev) (void)hipFree(res_dev);
-    return -1;
 }

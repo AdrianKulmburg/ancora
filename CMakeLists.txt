@@ -33,10 +33,31 @@
 #   -DANCORA_GPU_PLATFORM=nvidia
 #   -DANCORA_HIP_ARCHITECTURES=80
 #
+# VECTORIZATION: the FAST-mode CPU build (see "FAST CPU" below) is compiled
+# with -O3. It deliberately does NOT hardcode a -march= baseline here --
+# install_tool.sh queries the actual worker's CPU features (mirroring how it
+# already queries the actual GPU's compute capability, rather than assuming
+# one) and passes the resulting portable baseline (e.g. x86-64-v2/v3) via
+# -DCMAKE_C_FLAGS="-march=...". This CMakeLists just needs to not clobber
+# that: target_compile_options below adds -O3 without touching -march, so
+# whatever the caller supplies via CMAKE_C_FLAGS is respected. If configured
+# directly without that flag, GCC/Clang's default (no extra vectorization
+# baseline beyond the platform's mandatory minimum, i.e. SSE2 on x86-64) is
+# used -- safe on every x86-64 machine, just less aggressively vectorized.
+#
 # ============================================================================
 
 # NVIDIA HIP language support (HIP-over-CUDA via NVCC) requires CMake 3.28+.
 cmake_minimum_required(VERSION 3.28)
+
+# Default to a Release build if the caller didn't specify one. Without this,
+# CMake's default is NO optimization flags at all -- easy to forget to pass
+# -DCMAKE_BUILD_TYPE=Release by hand, and silently benchmark an unoptimized
+# build. Respects an explicit choice (Debug, RelWithDebInfo, ...) if given.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+endif()
 
 
 # ============================================================================
@@ -528,6 +549,18 @@ else()
 
         find_package(BLAS REQUIRED)
 
+        # -O3 for the elementwise/duality CPU loops (add/sub/scalarMul/neg/
+        # transpose below the GPU size threshold, and the SAFE/FAST fused
+        # support-function loops). Deliberately does NOT set -march= here:
+        # install_tool.sh queries the actual worker's CPU features (the same
+        # evidence-based approach it already uses for GPU architecture
+        # detection) and passes the result via -DCMAKE_C_FLAGS="-march=...",
+        # which this simply does not override. Configuring this project
+        # directly without that flag is still safe -- it just means no extra
+        # vectorization baseline beyond the compiler's own default.
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(ancora PRIVATE -O3)
+        endif()
 
         target_link_libraries(
             ancora
@@ -547,6 +580,13 @@ else()
             ${BLAS_LIBRARIES}
         )
 
+        # NOTE: BLAS_INCLUDE_DIRS (plural) matches CMake's own FindBLAS
+        # module convention. install_tool.sh must pass
+        # -DBLAS_INCLUDE_DIRS=... (not the singular BLAS_INCLUDE_DIR) for
+        # this check to actually see OpenBLAS's headers -- a mismatched
+        # variable name here silently skips this block (no error, since it's
+        # a soft feature probe, not a REQUIRED find), which was previously
+        # happening unnoticed.
         if(BLAS_INCLUDE_DIRS)
 
             set(

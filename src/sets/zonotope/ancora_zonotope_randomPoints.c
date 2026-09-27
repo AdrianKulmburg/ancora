@@ -1,5 +1,5 @@
 /*
- * ancora_zonotope_randomPoints.h
+ * ancora_zonotope_randomPoints.c
  *
  * Description
  * -----------
@@ -8,7 +8,7 @@
  * File Information
  * ----------------
  * Created:       2026-09-26
- * Last modified: 2026-09-26
+ * Last modified: 2026-09-27
  * Authors:       Adrian Kulmburg
  *
  * License
@@ -35,6 +35,16 @@ ancora_status ancora_zonotope_randomPoints_standard(ancora_mat *P,
  * points on the zonotope, though they are not uniformly distributed on it
  * (the map from the cube to the zonotope is not measure-preserving in
  * general).
+ *
+ * NOTE (not applied): P = G*X + c could in principle be folded into a
+ * single matmul by augmenting G with an extra column c and X with an extra
+ * row of ones (homogeneous-coordinates trick), removing the separate
+ * O(n*N) broadcast-add pass entirely. This is NOT done here because that
+ * broadcast pass is already asymptotically dominated by the O(n*m*N)
+ * matmul whenever m is not tiny -- the augmentation would trade a cheap,
+ * simple loop for extra copying (building the augmented G and X) to save
+ * a pass that is rarely the bottleneck. Worth reconsidering only if m is
+ * routinely very small relative to n and N in practice.
  *
  * INPUT:
  *      P               : Result matrix, already initialized as (n x N), where
@@ -175,6 +185,44 @@ cleanup:
     return status;
 }
 
+#if ANCORA_MODE == ANCORA_MODE_FAST && defined(ANCORA_USE_GPU)
+/* Persistent host-side packing buffers for the GPU path: grow-only,
+ * reused across calls, never freed until process exit -- avoids a fresh
+ * malloc/free of G_flat/c_flat/res_flat on every call, mirroring the
+ * device buffer cache added to ancora_zonotope_randomPoints_gpu.hip.cpp.
+ * This op is compute-bound (a matmul, O(n*M*N) FLOPs on O(n*M + M*N)
+ * data), the same category as ancora_mat_mul -- so, unlike the elementwise
+ * ops or the support-function reduction, there is deliberately NO size
+ * threshold gating the GPU dispatch below; it is always used when
+ * ANCORA_USE_GPU is defined. NOT thread-safe (module-level static state);
+ * fine for a single-threaded caller such as the benchmark driver. */
+static double *g_zrp_G_flat = NULL, *g_zrp_c_flat = NULL, *g_zrp_res_flat = NULL;
+static size_t g_zrp_G_capacity = 0, g_zrp_c_capacity = 0, g_zrp_res_capacity = 0;
+
+static int ancora_zrp_buf_ensure(size_t G_bytes, size_t c_bytes, size_t res_bytes)
+{
+    if (g_zrp_G_capacity < G_bytes) {
+        free(g_zrp_G_flat);
+        g_zrp_G_flat = (double *)malloc(G_bytes);
+        if (g_zrp_G_flat == NULL) { g_zrp_G_capacity = 0; return -1; }
+        g_zrp_G_capacity = G_bytes;
+    }
+    if (g_zrp_c_capacity < c_bytes) {
+        free(g_zrp_c_flat);
+        g_zrp_c_flat = (double *)malloc(c_bytes);
+        if (g_zrp_c_flat == NULL) { g_zrp_c_capacity = 0; return -1; }
+        g_zrp_c_capacity = c_bytes;
+    }
+    if (g_zrp_res_capacity < res_bytes) {
+        free(g_zrp_res_flat);
+        g_zrp_res_flat = (double *)malloc(res_bytes);
+        if (g_zrp_res_flat == NULL) { g_zrp_res_capacity = 0; return -1; }
+        g_zrp_res_capacity = res_bytes;
+    }
+    return 0;
+}
+#endif
+
 ancora_status ancora_zonotope_batched_randomPoints_standard(
     ancora_mat **P_batch,
     const ancora_zonotope **Z_batch,
@@ -206,10 +254,12 @@ ancora_status ancora_zonotope_batched_randomPoints_standard(
  *      possible reduction). The improvements are: one cube-sampling call
  *      instead of B, and, with ANCORA_USE_GPU, one fused kernel launch
  *      (doing the SAME total O(N*sum_b(n*m_b)) work, no zero-padding
- *      waste) instead of B separate matmul kernel launches.
+ *      waste) instead of B separate matmul kernel launches, now using
+ *      persistent host/device packing buffers instead of a fresh
+ *      malloc/hipMalloc per call.
  *
  * Created:       2026-09-26
- * Last modified: 2026-09-26
+ * Last modified: 2026-09-27
  * Author(s):     Adrian Kulmburg
  */
 {
@@ -327,33 +377,32 @@ ancora_status ancora_zonotope_batched_randomPoints_standard(
     }
 #elif ANCORA_MODE == ANCORA_MODE_FAST
     #ifdef ANCORA_USE_GPU
-        // Pack G (n x M) and c (B x n) into flat buffers; Xbig is already
+        // G, c, and result buffers are persistent, grow-only host
+        // allocations (see ancora_zrp_buf_ensure) reused across calls,
+        // rather than freshly malloc'd/freed every call. Xbig is already
         // exactly the (M x N) shape the kernel needs, no repacking.
-        double *G_flat = (double *)malloc((size_t)(n * M) * sizeof(double));
-        double *c_flat = (double *)malloc((size_t)(B * n) * sizeof(double));
-        double *res_flat = (double *)malloc((size_t)(B * n * N) * sizeof(double));
-        if (G_flat == NULL || c_flat == NULL || res_flat == NULL) {
-            free(G_flat); free(c_flat); free(res_flat);
+        size_t G_bytes = (size_t)(n * M) * sizeof(double);
+        size_t c_bytes = (size_t)(B * n) * sizeof(double);
+        size_t res_bytes = (size_t)(B * n * N) * sizeof(double);
+        if (ancora_zrp_buf_ensure(G_bytes, c_bytes, res_bytes) != 0) {
             status = ANCORA_ERROR_ALLOC;
             goto cleanup;
         }
         for (slong b = 0; b < B; b++) {
             for (slong i = 0; i < n; i++) {
-                memcpy(&G_flat[i * M + offset[b]], &Z_batch[b]->G.repr[i * m[b]], (size_t)m[b] * sizeof(double));
+                memcpy(&g_zrp_G_flat[i * M + offset[b]], &Z_batch[b]->G.repr[i * m[b]], (size_t)m[b] * sizeof(double));
             }
-            memcpy(&c_flat[b * n], Z_batch[b]->c.repr, (size_t)n * sizeof(double));
+            memcpy(&g_zrp_c_flat[b * n], Z_batch[b]->c.repr, (size_t)n * sizeof(double));
         }
 
         int gpu_status = ancora_zonotope_batched_randomPoints_standard_gpu(
-            G_flat, Xbig.repr, c_flat, offset, m, res_flat, n, M, N, B);
+            g_zrp_G_flat, Xbig.repr, g_zrp_c_flat, offset, m, g_zrp_res_flat, n, M, N, B);
 
         if (gpu_status == 0) {
             for (slong b = 0; b < B; b++) {
-                memcpy(P_batch[b]->repr, &res_flat[b * n * N], (size_t)(n * N) * sizeof(double));
+                memcpy(P_batch[b]->repr, &g_zrp_res_flat[b * n * N], (size_t)(n * N) * sizeof(double));
             }
         }
-
-        free(G_flat); free(c_flat); free(res_flat);
 
         if (gpu_status != 0) {
             status = ANCORA_ERROR_GPU_LAUNCH;
