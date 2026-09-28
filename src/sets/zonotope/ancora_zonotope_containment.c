@@ -7,14 +7,14 @@
  * points) is contained in the zonotope.
  *
  * Containment is decided by solving a linear feasibility problem with
- * HiGHS in ANCORA_MODE_FAST mode. In ANCORA_MODE_SAFE mode the LP is not
+ * GLPK in ANCORA_MODE_FAST mode. In ANCORA_MODE_SAFE mode the LP is not
  * implemented and the functions return ANCORA_ERROR_NOT_IMPLEMENTED.
  *
  * ancora_zonotope_containsPoints builds the LP's constraint matrix (Z->G,
- * shared by every point) and creates the HiGHS instance ONCE, then, for
+ * shared by every point) and creates the GLPK instance ONCE, then, for
  * each point, only updates the row bounds (p - c changes per point, the
  * matrix does not) and re-solves the same instance -- rather than
- * rebuilding the matrix and creating/destroying a fresh HiGHS instance per
+ * rebuilding the matrix and creating/destroying a fresh GLPK instance per
  * point, which is what the previous version of this file did by calling
  * ancora_zonotope_contains (a full standalone LP build+solve) once per
  * column. ancora_zonotope_contains is now a thin wrapper delegating to
@@ -23,7 +23,7 @@
  * File Information
  * ----------------
  * Created:       2026-09-24
- * Last modified: 2026-09-26
+ * Last modified: 2026-09-28
  * Authors:       Adrian Kulmburg
  *
  * License
@@ -35,14 +35,14 @@
 #include "ancora/sets/zonotope/ancora_zonotope_containment.h"
 
 #if ANCORA_MODE == ANCORA_MODE_FAST
-#include <highs/interfaces/highs_c_api.h>
+#include <glpk.h>
 #endif
 
 ancora_status ancora_zonotope_containsPoint(const ancora_zonotope *Z,
                                        const ancora_vec *p,
                                        ancora_truth *contained)
 /* Checks whether the point p is contained in the zonotope Z.
- * This is decided by solving a linear feasibility problem with HiGHS in
+ * This is decided by solving a linear feasibility problem with GLPK in
  * ANCORA_MODE_FAST mode; in ANCORA_MODE_SAFE mode it returns
  * ANCORA_ERROR_NOT_IMPLEMENTED at the moment.
  *
@@ -97,7 +97,7 @@ ancora_status ancora_zonotope_containsPoints(const ancora_zonotope *Z,
  *      TODO: Centrally, for optimization once it has been determined accurately
  *
  * Created:       2026-09-26
- * Last modified: 2026-09-26
+ * Last modified: 2026-09-28
  * Author(s):     Adrian Kulmburg
  */
 {
@@ -134,146 +134,111 @@ ancora_status ancora_zonotope_containsPoints(const ancora_zonotope *Z,
         return ANCORA_OK;
     }
 
-    HighsInt numcol = (HighsInt)p_nr;
-    HighsInt numrow = (HighsInt)n;
-    HighsInt numnz = (HighsInt)(n * p_nr);
+    int numcol = (int)p_nr;
+    int numrow = (int)n;
+    int numnz = (int)(n * p_nr);
 
-    HighsInt *astart = NULL, *aindex = NULL, *set = NULL;
-    double *avalue = NULL, *colcost = NULL, *collower = NULL, *colupper = NULL;
-    double *rowlower = NULL, *rowupper = NULL;
-    void *highs = NULL;
+    /* GLPK's sparse triplet arrays are 1-indexed; index 0 is unused, so
+     * every array below is allocated with one extra slot. */
+    int *ia = NULL, *ja = NULL;
+    double *ar = NULL;
+    glp_prob *lp = NULL;
 
-    // For garbage collection
-    // TODO: This is new, might want to implement ANCORA_ERROR globally that way
     ancora_status status = ANCORA_OK;
 
-    astart = (HighsInt *)malloc((size_t)(numcol + 1) * sizeof(HighsInt));
-    aindex = (HighsInt *)malloc((size_t)numnz * sizeof(HighsInt));
-    avalue = (double *)malloc((size_t)numnz * sizeof(double));
-    colcost = (double *)calloc((size_t)numcol, sizeof(double));
-    collower = (double *)malloc((size_t)numcol * sizeof(double));
-    colupper = (double *)malloc((size_t)numcol * sizeof(double));
-    rowlower = (double *)malloc((size_t)numrow * sizeof(double));
-    rowupper = (double *)malloc((size_t)numrow * sizeof(double));
-    set = (HighsInt *)malloc((size_t)numrow * sizeof(HighsInt));
+    ia = (int *)malloc((size_t)(numnz + 1) * sizeof(int));
+    ja = (int *)malloc((size_t)(numnz + 1) * sizeof(int));
+    ar = (double *)malloc((size_t)(numnz + 1) * sizeof(double));
 
-    if (astart == NULL || aindex == NULL || avalue == NULL || colcost == NULL ||
-        collower == NULL || colupper == NULL || rowlower == NULL ||
-        rowupper == NULL || set == NULL) {
+    if (ia == NULL || ja == NULL || ar == NULL) {
         status = ANCORA_ERROR_ALLOC;
         goto cleanup;
     }
 
-    /* Variable bounds: -1 <= beta <= 1 (shared by every point). */
+    lp = glp_create_prob();
+    if (lp == NULL) {
+        status = ANCORA_ERROR_ALLOC;
+        goto cleanup;
+    }
+    glp_set_obj_dir(lp, GLP_MIN);
+
+    glp_add_rows(lp, numrow);
+    glp_add_cols(lp, numcol);
+
+    /* Variable bounds: -1 <= beta <= 1 (shared by every point). Objective
+     * coefficients default to 0, which is exactly the feasibility problem
+     * we want -- there's nothing to minimize, only a feasible point to
+     * find. */
     for (slong j = 0; j < p_nr; j++) {
-        collower[j] = -1.0;
-        colupper[j] = 1.0;
+        glp_set_col_bnds(lp, (int)(j + 1), GLP_DB, -1.0, 1.0);
     }
 
-    /* set = {0, 1, ..., n-1}: every row index, used to update ALL row
-     * bounds at once for each point via Highs_changeRowsBoundsBySet. */
+    /* Build the sparse constraint matrix A = G. Z->G does not change
+     * across points, so this is done ONCE. */
+    int nz = 0;
     for (slong i = 0; i < n; i++) {
-        set[i] = (HighsInt)i;
-    }
-
-    /* Build the sparse constraint matrix A = G in column-wise format.
-     * Z->G does not change across points, so this is done ONCE. */
-    HighsInt nz = 0;
-    for (slong j = 0; j < p_nr; j++) {
-        astart[j] = nz;
-        for (slong i = 0; i < n; i++) {
-            aindex[nz] = (HighsInt)i;
-            avalue[nz] = Z->G.repr[i * p_nr + j];
+        for (slong j = 0; j < p_nr; j++) {
             nz++;
+            ia[nz] = (int)(i + 1);
+            ja[nz] = (int)(j + 1);
+            ar[nz] = Z->G.repr[i * p_nr + j];
         }
     }
-    astart[p_nr] = nz;
+    glp_load_matrix(lp, nz, ia, ja, ar);
 
-    /* Right-hand side for point 0: rowlower = rowupper = p_0 - c. */
+    /* Right-hand side for point 0: rowlower = rowupper = p_0 - c, i.e. an
+     * equality (fixed) row. */
     for (slong i = 0; i < n; i++) {
-        rowlower[i] = P->repr[i * k + 0] - Z->c.repr[i];
-        rowupper[i] = rowlower[i];
+        double rhs = P->repr[i * k + 0] - Z->c.repr[i];
+        glp_set_row_bnds(lp, (int)(i + 1), GLP_FX, rhs, rhs);
     }
 
-    highs = Highs_create();
-    if (highs == NULL) {
-        status = ANCORA_ERROR_ALLOC;
-        goto cleanup;
-    }
-
-    // Disable console logging
-    Highs_setBoolOptionValue(highs, "log_to_console", false);
-
-    // This LP is re-solved many times with only the right-hand side changing
-    // (Highs_changeRowsBoundsBySet); presolve re-analyzes the whole problem
-    // on every Highs_run call regardless, which for a problem this small
-    // and cheap can dominate over the actual solve - disable it so re-solves
-    // go straight to the solver. Simplex (not the default auto-chosen method,
-    // which may select IPM) is forced because only simplex can warm-start
-    // from the previous optimal basis after a bound change; IPM effectively
-    // restarts from scratch on every re-solve, defeating the whole point of
-    // reusing one HiGHS instance across points.
-    Highs_setStringOptionValue(highs, "presolve", "off");
-    Highs_setStringOptionValue(highs, "solver", "simplex");
-
-    HighsInt pass_status = Highs_passLp(highs, numcol, numrow, numnz,
-                                        kHighsMatrixFormatColwise,
-                                        kHighsObjSenseMinimize, 0.0,
-                                        colcost, collower, colupper,
-                                        rowlower, rowupper,
-                                        astart, aindex, avalue);
-    if (pass_status != kHighsStatusOk) {
-        status = ANCORA_ERROR_INVALID_ARG;
-        goto cleanup;
-    }
+    glp_smcp parm;
+    glp_init_smcp(&parm);
+    parm.msg_lev = GLP_MSG_OFF;
+    parm.presolve = GLP_OFF;
+    parm.meth = GLP_PRIMAL;
 
     ancora_setYes(contained);
     for (slong j = 0; j < k; j++) {
         if (j > 0) {
             /* Only the right-hand side changes between points; update it
-             * in place and re-solve the SAME instance rather than
-             * rebuilding the LP. */
+             * in place and re-solve the SAME glp_prob rather than
+             * rebuilding the LP. glp_simplex always warm-starts from
+             * whatever basis is already loaded, so re-solving after an
+             * RHS-only change picks up from the previous optimal basis;
+             * dual simplex is the natural method for recovering
+             * optimality in that situation. */
             for (slong i = 0; i < n; i++) {
-                rowlower[i] = P->repr[i * k + j] - Z->c.repr[i];
-                rowupper[i] = rowlower[i];
+                double rhs = P->repr[i * k + j] - Z->c.repr[i];
+                glp_set_row_bnds(lp, (int)(i + 1), GLP_FX, rhs, rhs);
             }
-            HighsInt change_status = Highs_changeRowsBoundsBySet(
-                highs, numrow, set, rowlower, rowupper);
-            if (change_status != kHighsStatusOk) {
-                status = ANCORA_ERROR_INVALID_ARG;
-                goto cleanup;
-            }
+            parm.meth = GLP_DUAL;
         }
 
-        HighsInt run_status = Highs_run(highs);
-        if (run_status != kHighsStatusOk) {
+        int run_status = glp_simplex(lp, &parm);
+        if (run_status != 0) {
             status = ANCORA_ERROR_INVALID_ARG;
             goto cleanup;
         }
 
-        HighsInt model_status = Highs_getModelStatus(highs);
-        if (model_status != kHighsModelStatusOptimal) {
+        int model_status = glp_get_status(lp);
+        if (model_status != GLP_OPT) {
             ancora_setNo(contained);
             break; /* short-circuit: no need to check remaining points */
         }
     }
 
 cleanup:
-    if (highs != NULL) {
-        Highs_destroy(highs);
+    if (lp != NULL) {
+        glp_delete_prob(lp);
     }
-    free(astart);
-    free(aindex);
-    free(avalue);
-    free(colcost);
-    free(collower);
-    free(colupper);
-    free(rowlower);
-    free(rowupper);
-    free(set);
+    free(ia);
+    free(ja);
+    free(ar);
 
     if (status != ANCORA_OK) {
-        ANCORA_ERROR(status, "Failed to pass the containment LP to HiGHS.");
+        ANCORA_ERROR(status, "Failed to pass the containment LP to GLPK.");
     }
     return ANCORA_OK;
 #endif
@@ -311,11 +276,12 @@ ancora_status ancora_zonotope_batched_containsPoints(
  *      ancora_zonotope_containsPoints calls. The saving is avoiding B
  *      allocations of the n-sized arrays (allocated once instead) and,
  *      when generator counts repeat/are similar across the batch,
- *      avoiding repeated malloc/free of the p_b-sized arrays via reuse
- *      with growth - not a reduction in LP-solving work itself.
+ *      avoiding repeated malloc/free of the p_b-sized sparse-matrix
+ *      arrays via reuse with growth - not a reduction in LP-solving work
+ *      itself.
  *
  * Created:       2026-09-27
- * Last modified: 2026-09-27
+ * Last modified: 2026-09-28
  * Author(s):     Adrian Kulmburg
  */
 {
@@ -365,177 +331,121 @@ ancora_status ancora_zonotope_batched_containsPoints(
     ANCORA_ERROR(ANCORA_ERROR_NOT_IMPLEMENTED,
                  "Zonotope point containment via linear programming is only implemented in FAST mode; SAFE mode is not supported.");
 #elif ANCORA_MODE == ANCORA_MODE_FAST
-    HighsInt numrow = (HighsInt)n;
+    int numrow = (int)n;
 
-    // n is shared across the whole batch, so these are allocated ONCE.
-    double *rowlower = (double *)malloc((size_t)numrow * sizeof(double));
-    double *rowupper = (double *)malloc((size_t)numrow * sizeof(double));
-    HighsInt *set = (HighsInt *)malloc((size_t)numrow * sizeof(HighsInt));
-    if (rowlower == NULL || rowupper == NULL || set == NULL) {
-        free(rowlower);
-        free(rowupper);
-        free(set);
-        ANCORA_ERROR(ANCORA_ERROR_ALLOC, "ancora_zonotope_batched_containsPoints: failed to allocate shared row bookkeeping arrays.");
-    }
-    for (slong i = 0; i < n; i++) {
-        set[i] = (HighsInt)i;
-    }
-
-    // p_b-sized arrays: grown via realloc as needed, reused across pairs.
-    HighsInt *astart = NULL, *aindex = NULL;
-    double *avalue = NULL, *colcost = NULL, *collower = NULL, *colupper = NULL;
-    slong cap_p = 0, cap_nz = 0;
+    /* p_b-sized sparse-matrix arrays: grown via realloc as needed, reused
+     * across pairs. GLPK's triplet arrays are 1-indexed, so allocate one
+     * extra slot whenever they're (re)sized. */
+    int *ia = NULL, *ja = NULL;
+    double *ar = NULL;
+    slong cap_nz = 0;
 
     ancora_status status = ANCORA_OK;
     ancora_setYes(contained);
+
+    glp_smcp parm;
+    glp_init_smcp(&parm);
+    parm.msg_lev = GLP_MSG_OFF;
+    parm.presolve = GLP_OFF;
 
     for (slong b = 0; b < B && status == ANCORA_OK; b++) {
         const ancora_zonotope *Z = Z_batch[b];
         const ancora_mat *P = P_batch[b];
         slong p_nr = Z->G.ncols;
         slong k = P->ncols;
-        HighsInt numcol = (HighsInt)p_nr;
-        HighsInt numnz = (HighsInt)(n * p_nr);
+        int numcol = (int)p_nr;
+        int numnz = (int)(n * p_nr);
 
         if (k <= 0) {
             continue; /* vacuously satisfied for this pair; nothing to solve */
         }
 
-        // Grow the p_b-sized arrays if this pair needs more room than the
+        // Grow the nz-sized arrays if this pair needs more room than the
         // largest pair seen so far; never shrink.
-        if (p_nr > cap_p) {
-            HighsInt *new_astart = (HighsInt *)realloc(astart, (size_t)(numcol + 1) * sizeof(HighsInt));
-            double *new_colcost = (double *)realloc(colcost, (size_t)numcol * sizeof(double));
-            double *new_collower = (double *)realloc(collower, (size_t)numcol * sizeof(double));
-            double *new_colupper = (double *)realloc(colupper, (size_t)numcol * sizeof(double));
-            if (new_astart == NULL || new_colcost == NULL || new_collower == NULL || new_colupper == NULL) {
-                free(new_astart == NULL ? astart : new_astart);
-                free(new_colcost == NULL ? colcost : new_colcost);
-                free(new_collower == NULL ? collower : new_collower);
-                free(new_colupper == NULL ? colupper : new_colupper);
-                astart = NULL; colcost = NULL; collower = NULL; colupper = NULL;
-                status = ANCORA_ERROR_ALLOC;
-                break;
-            }
-            astart = new_astart;
-            colcost = new_colcost;
-            collower = new_collower;
-            colupper = new_colupper;
-            cap_p = p_nr;
-        }
         if (numnz > cap_nz) {
-            HighsInt *new_aindex = (HighsInt *)realloc(aindex, (size_t)numnz * sizeof(HighsInt));
-            double *new_avalue = (double *)realloc(avalue, (size_t)numnz * sizeof(double));
-            if (new_aindex == NULL || new_avalue == NULL) {
-                free(new_aindex == NULL ? aindex : new_aindex);
-                free(new_avalue == NULL ? avalue : new_avalue);
-                aindex = NULL; avalue = NULL;
+            int *new_ia = (int *)realloc(ia, (size_t)(numnz + 1) * sizeof(int));
+            int *new_ja = (int *)realloc(ja, (size_t)(numnz + 1) * sizeof(int));
+            double *new_ar = (double *)realloc(ar, (size_t)(numnz + 1) * sizeof(double));
+            if (new_ia == NULL || new_ja == NULL || new_ar == NULL) {
+                free(new_ia == NULL ? ia : new_ia);
+                free(new_ja == NULL ? ja : new_ja);
+                free(new_ar == NULL ? ar : new_ar);
+                ia = NULL; ja = NULL; ar = NULL;
                 status = ANCORA_ERROR_ALLOC;
                 break;
             }
-            aindex = new_aindex;
-            avalue = new_avalue;
+            ia = new_ia;
+            ja = new_ja;
+            ar = new_ar;
             cap_nz = numnz;
         }
 
-        // Rebuild this pair's LP data (must be redone every pair: G_b differs).
-        memset(colcost, 0, (size_t)numcol * sizeof(double));
-        for (slong j = 0; j < p_nr; j++) {
-            collower[j] = -1.0;
-            colupper[j] = 1.0;
-        }
-        HighsInt nz = 0;
-        for (slong j = 0; j < p_nr; j++) {
-            astart[j] = nz;
-            for (slong i = 0; i < n; i++) {
-                aindex[nz] = (HighsInt)i;
-                avalue[nz] = Z->G.repr[i * p_nr + j];
-                nz++;
-            }
-        }
-        astart[p_nr] = nz;
-
-        for (slong i = 0; i < n; i++) {
-            rowlower[i] = P->repr[i * k + 0] - Z->c.repr[i];
-            rowupper[i] = rowlower[i];
-        }
-
-        void *highs = Highs_create();
-        if (highs == NULL) {
+        // Rebuild this pair's LP data (must be redone every pair: G_b
+        // differs, and each pair gets its own glp_prob since numcol/numrow
+        // can differ pair to pair).
+        glp_prob *lp = glp_create_prob();
+        if (lp == NULL) {
             status = ANCORA_ERROR_ALLOC;
             break;
         }
+        glp_set_obj_dir(lp, GLP_MIN);
+        glp_add_rows(lp, numrow);
+        glp_add_cols(lp, numcol);
 
-        // Disable console logging
-        Highs_setBoolOptionValue(highs, "log_to_console", false);
-
-        // This LP is re-solved many times with only the right-hand side changing
-        // (Highs_changeRowsBoundsBySet); presolve re-analyzes the whole problem
-        // on every Highs_run call regardless, which for a problem this small
-        // and cheap can dominate over the actual solve -- disable it so re-solves
-        // go straight to the solver. Simplex (not the default auto-chosen method,
-        // which may select IPM) is forced because only simplex can warm-start
-        // from the previous optimal basis after a bound change; IPM effectively
-        // restarts from scratch on every re-solve, defeating the whole point of
-        // reusing one HiGHS instance across points.
-        Highs_setStringOptionValue(highs, "presolve", "off");
-        Highs_setStringOptionValue(highs, "solver", "simplex");
-
-        HighsInt pass_status = Highs_passLp(highs, numcol, numrow, numnz,
-                                            kHighsMatrixFormatColwise,
-                                            kHighsObjSenseMinimize, 0.0,
-                                            colcost, collower, colupper,
-                                            rowlower, rowupper,
-                                            astart, aindex, avalue);
-        if (pass_status != kHighsStatusOk) {
-            Highs_destroy(highs);
-            status = ANCORA_ERROR_INVALID_ARG;
-            break;
+        for (slong j = 0; j < p_nr; j++) {
+            glp_set_col_bnds(lp, (int)(j + 1), GLP_DB, -1.0, 1.0);
         }
+
+        int nz = 0;
+        for (slong i = 0; i < n; i++) {
+            for (slong j = 0; j < p_nr; j++) {
+                nz++;
+                ia[nz] = (int)(i + 1);
+                ja[nz] = (int)(j + 1);
+                ar[nz] = Z->G.repr[i * p_nr + j];
+            }
+        }
+        glp_load_matrix(lp, nz, ia, ja, ar);
+
+        for (slong i = 0; i < n; i++) {
+            double rhs = P->repr[i * k + 0] - Z->c.repr[i];
+            glp_set_row_bnds(lp, (int)(i + 1), GLP_FX, rhs, rhs);
+        }
+
+        parm.meth = GLP_PRIMAL;
 
         for (slong j = 0; j < k; j++) {
             if (j > 0) {
                 for (slong i = 0; i < n; i++) {
-                    rowlower[i] = P->repr[i * k + j] - Z->c.repr[i];
-                    rowupper[i] = rowlower[i];
+                    double rhs = P->repr[i * k + j] - Z->c.repr[i];
+                    glp_set_row_bnds(lp, (int)(i + 1), GLP_FX, rhs, rhs);
                 }
-                HighsInt change_status = Highs_changeRowsBoundsBySet(
-                    highs, numrow, set, rowlower, rowupper);
-                if (change_status != kHighsStatusOk) {
-                    status = ANCORA_ERROR_INVALID_ARG;
-                    break;
-                }
+                parm.meth = GLP_DUAL;
             }
 
-            HighsInt run_status = Highs_run(highs);
-            if (run_status != kHighsStatusOk) {
+            int run_status = glp_simplex(lp, &parm);
+            if (run_status != 0) {
                 status = ANCORA_ERROR_INVALID_ARG;
                 break;
             }
 
-            HighsInt model_status = Highs_getModelStatus(highs);
-            if (model_status != kHighsModelStatusOptimal) {
+            int model_status = glp_get_status(lp);
+            if (model_status != GLP_OPT) {
                 ancora_setNo(contained);
                 break; /* short-circuit: stop checking this pair's remaining points */
             }
         }
 
-        Highs_destroy(highs);
+        glp_delete_prob(lp);
 
         if (!ancora_yes(*contained)) {
             break; /* short-circuit: stop checking any further pairs too */
         }
     }
 
-    free(rowlower);
-    free(rowupper);
-    free(set);
-    free(astart);
-    free(aindex);
-    free(avalue);
-    free(colcost);
-    free(collower);
-    free(colupper);
+    free(ia);
+    free(ja);
+    free(ar);
 
     if (status != ANCORA_OK) {
         ANCORA_ERROR(status, "ancora_zonotope_batched_containsPoints: LP setup/solve failed (see above).");

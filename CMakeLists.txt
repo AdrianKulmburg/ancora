@@ -12,14 +12,14 @@
 #   FAST:
 #       -DANCORA_MODE_SAFE=OFF
 #       -> libancora_fast.a
-#       -> BLAS + HiGHS
+#       -> BLAS + GLPK
 #
 #   FAST + NVIDIA GPU:
 #       -DANCORA_MODE_SAFE=OFF
 #       -DANCORA_USE_GPU=ON
 #       -DANCORA_GPU_PLATFORM=nvidia
 #       -> libancora_fast_gpu.a
-#       -> HIP-over-CUDA + hipBLAS + HiGHS
+#       -> HIP-over-CUDA + hipBLAS + GLPK
 #
 # SAFE and FAST are ABI-incompatible and must never be mixed.
 #
@@ -205,7 +205,7 @@ endif()
 
 if(NOT ANCORA_MODE_SAFE)
 
-    find_package(HIGHS REQUIRED)
+    find_package(GLPK REQUIRED)
 
 endif()
 
@@ -631,13 +631,13 @@ else()
 
 
     # ------------------------------------------------------------------------
-    # HiGHS
+    # GLPK
     # ------------------------------------------------------------------------
 
     target_link_libraries(
         ancora
         PUBLIC
-            HIGHS::HIGHS
+            GLPK::GLPK
     )
 
 endif()
