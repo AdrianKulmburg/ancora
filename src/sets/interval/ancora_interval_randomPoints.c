@@ -8,7 +8,7 @@
  * File Information
  * ----------------
  * Created:       2026-09-26
- * Last modified: 2026-09-26
+ * Last modified: 2026-09-28
  * Authors:       Adrian Kulmburg
  *
  * License
@@ -95,17 +95,22 @@ ancora_status ancora_interval_randomPoints_uniform(ancora_mat *P,
     }
 
     /* For each point, sample each coordinate independently and uniformly from
-     * its [lower, upper] box. The bounds are read as doubles (arb_get_d in
-     * SAFE mode, direct in FAST mode) and fed to ancora_random_uniform, which
-     * is the mode-independent uniform sampler used by the existing set
-     * templates (e.g. ancora_interval_initRandom_uniform). */
+     * its [lower, upper] box. The bounds are read as doubles (via the arb_t
+     * midpoint in SAFE mode, direct in FAST mode) and fed to
+     * ancora_random_uniform, which is the mode-independent uniform sampler
+     * used by the existing set templates (e.g.
+     * ancora_interval_initRandom_uniform).
+     *
+     * NOTE on arb -> double: there is no arb_get_d in Arb's API. An arb_t is
+     * a midpoint (arf_t) plus a radius, so extracting a double goes through
+     * the midpoint explicitly: arf_get_d(arb_midref(x), ARF_RND_NEAR). */
 #if ANCORA_MODE == ANCORA_MODE_SAFE
     double lo, hi, sample;
     for (slong j = 0; j < N; j++) {
         for (slong i = 0; i < n; i++) {
             // TODO: That's not quite ok, correct in the future
-            lo = arb_get_d(arb_mat_entry(I->lowerBound.repr, i, 0));
-            hi = arb_get_d(arb_mat_entry(I->upperBound.repr, i, 0));
+            lo = arf_get_d(arb_midref(arb_mat_entry(I->lowerBound.repr, i, 0)), ARF_RND_NEAR);
+            hi = arf_get_d(arb_midref(arb_mat_entry(I->upperBound.repr, i, 0)), ARF_RND_NEAR);
 
             /* ancora_random_uniform handles lo == hi (returns lo) and rejects
              * lo > hi (an empty interval) with ANCORA_ERROR_INVALID_ARG. */

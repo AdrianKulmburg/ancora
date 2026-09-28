@@ -8,7 +8,7 @@
  * File Information
  * ----------------
  * Created:       2026-09-25
- * Last modified: 2026-09-25
+ * Last modified: 2026-09-28
  * Authors:       Adrian Kulmburg
  *
  * License
@@ -67,17 +67,25 @@ ancora_status ancora_zonotope_init(ancora_zonotope *Z,
     }
 
     /* Validate c and G: no NaN, no +-inf.
+     *
+     * There is no arb_is_nan in Arb's API. An arb_t is NaN when its midpoint
+     * (an arf_t) is NaN, so the check goes through the midpoint explicitly
+     * via arf_is_nan(arb_midref(x)). Strictly, arb_is_finite(x) already
+     * implies "not NaN" (a NaN midpoint makes the ball non-finite too), so
+     * the arf_is_nan(...) check below is redundant with the arb_is_finite
+     * check right next to it -- kept anyway to make the NaN case explicit
+     * in the error path, matching the original intent of this check.
      */
     for (slong i = 0; i < c->nrows; i++)
     {
 #if ANCORA_MODE == ANCORA_MODE_SAFE
-        if (arb_is_nan(arb_mat_entry(c->repr, i, 0)) || !arb_is_finite(arb_mat_entry(c->repr, i, 0)))
+        if (arf_is_nan(arb_midref(arb_mat_entry(c->repr, i, 0))) || !arb_is_finite(arb_mat_entry(c->repr, i, 0)))
         {
             ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Vector c has NaN or +-inf in entry %ld; must not be NaN or +-inf.", (long)i);
         }
         for (slong j = 0; j < G->ncols; j++)
         {
-            if (arb_is_nan(arb_mat_entry(G->repr, i, j)) || !arb_is_finite(arb_mat_entry(G->repr, i, j)))
+            if (arf_is_nan(arb_midref(arb_mat_entry(G->repr, i, j))) || !arb_is_finite(arb_mat_entry(G->repr, i, j)))
             {
                 ANCORA_ERROR(ANCORA_ERROR_INVALID_ARG, "Matrix G has NaN or +-inf in entry (%ld,%ld); must not be NaN or +-inf.", (long)i, (long)j);
             }

@@ -9,7 +9,7 @@
  * File Information
  * ----------------
  * Created:       2026-09-24
- * Last modified: 2026-09-24
+ * Last modified: 2026-09-28
  * Authors:       Adrian Kulmburg
  *
  * License
@@ -97,9 +97,12 @@ void ancora_random_setSeed(unsigned int seed)
 #if ANCORA_MODE == ANCORA_MODE_SAFE
     uint64_t f1 = splitmix64Next(&sm_state);
     uint64_t f2 = splitmix64Next(&sm_state);
-    flint_randclear(ancora_flint_rand_state);
-    flint_randinit(ancora_flint_rand_state);
-    flint_randseed(ancora_flint_rand_state, (ulong)f1, (ulong)f2);
+    /* FLINT 3.x renamed the old camelCase rand-state API
+     * (flint_randinit/flint_randclear/flint_randseed, now deprecated) to
+     * the flint_rand_* names below. */
+    flint_rand_clear(ancora_flint_rand_state);
+    flint_rand_init(ancora_flint_rand_state);
+    flint_rand_set_seed(ancora_flint_rand_state, (ulong)f1, (ulong)f2);
 #endif
 
     ancora_rand_seeded = true;
