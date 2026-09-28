@@ -17,6 +17,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "ancora/linalg/matrices/ancora_mat_arithmetic.h"
+
 #if ANCORA_MODE == ANCORA_MODE_FAST
 #include <limits.h>
 #endif
@@ -24,8 +26,6 @@
 #if ANCORA_MODE == ANCORA_MODE_FAST && !defined(ANCORA_USE_GPU)
 #include <cblas.h>
 #endif
-
-#include "ancora/linalg/matrices/ancora_mat_arithmetic.h"
 
 /* Below this element count, the plain CPU loop is used even when
  * ANCORA_USE_GPU is defined. add/sub/scalarMul/neg/transpose are all
